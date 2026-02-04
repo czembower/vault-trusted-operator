@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -65,6 +66,7 @@ func (s *ServerSelector) probe(ctx context.Context, addr string) (time.Duration,
 	start := time.Now()
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
+		log.Printf("Error: %v\n", err)
 		return 0, false
 	}
 	resp.Body.Close()

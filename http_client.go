@@ -6,9 +6,10 @@ import (
 	"net"
 	"net/http"
 	"time"
+	"vault-trusted-operator/config"
 )
 
-func NewHTTPClient(cfg Config) *http.Client {
+func NewHTTPClient(cfg config.Config) *http.Client {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{

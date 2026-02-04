@@ -1,28 +1,27 @@
-// secret_id.go
-package main
+package authmanager
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log"
-	"os"
 	"time"
+	"vault-trusted-operator/config"
 
 	vault "github.com/hashicorp/vault/api"
 )
 
 type SecretIDRefresher struct {
-	Cfg  Config
+	Cfg  config.Config
 	Log  *log.Logger
 	Auth *AuthManager
 }
 
 // Run keeps an in-memory secret-id fresh by periodically requesting a new one.
 // This avoids forcing an interactive OIDC bootstrap if token renewal fails at an inconvenient time.
-func (s *SecretIDRefresher) Run(ctx context.Context) {
+func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
 	// Initial delay: try immediately
+	s.Log.Printf("secret-id: refresher running")
 	for {
 		select {
 		case <-ctx.Done():
@@ -30,7 +29,7 @@ func (s *SecretIDRefresher) Run(ctx context.Context) {
 		default:
 		}
 
-		ttl, err := s.refreshOnce(ctx, s.Cfg.InMemSecretTTL, nil) // raw secret-id (no wrapping)
+		ttl, err := s.refreshOnce(ctx, s.Cfg.InMemSecretTTL, nil, t) // raw secret-id (no wrapping)
 		if err != nil {
 			s.Log.Printf("secret-id refresh failed: %v", err)
 			select {
@@ -56,39 +55,31 @@ func (s *SecretIDRefresher) Run(ctx context.Context) {
 	}
 }
 
-// WriteWrappedSecretIDToFile requests a wrapped secret-id and writes the wrapping token to SecretIDFile.
-// The wrapping token and secret ID are both valid for the period set by Cfg.WrapTTL
-func (s *SecretIDRefresher) WriteWrappedSecretIDToFile(ctx context.Context) error {
-	_, err := s.refreshOnce(ctx, s.Cfg.WrapTTL, &s.Cfg.WrapTTL) // wrapped token output
+func (s *SecretIDRefresher) RefreshWrappedSecretID(ctx context.Context, t *TokenProvider) error {
+	_, err := s.refreshOnce(ctx, s.Cfg.WrapTTL, &s.Cfg.WrapTTL, t) // wrapped token output, stored in CredStore
 	return err
 }
 
-func (s *SecretIDRefresher) refreshOnce(ctx context.Context, rawTTL time.Duration, wrapTTL *time.Duration) (time.Duration, error) {
-	client, err := s.Auth.Client(ctx)
-	if err != nil {
-		return 0, err
-	}
-
+func (s *SecretIDRefresher) refreshOnce(ctx context.Context, rawTTL time.Duration, wrapTTL *time.Duration, t *TokenProvider) (time.Duration, error) {
+	s.Log.Printf("secret-id: refresh once triggered")
 	payload := map[string]any{}
 	if wrapTTL == nil {
 		// raw secret-id request includes a TTL
 		payload["ttl"] = int(rawTTL.Seconds())
 	}
 
-	secret, err := vaultWrite(ctx, client, s.Cfg.AppRoleSecretIDPath(), payload, wrapTTL)
+	secret, err := vaultWriteWithReauth(ctx, s.Auth, s.Cfg.AppRoleSecretIDPath(), payload, wrapTTL, t, s)
+
 	if err != nil {
 		return 0, err
 	}
 
-	// Wrapped path: write wrap token to file
+	// write wrapping token to state
 	if wrapTTL != nil {
 		if secret.WrapInfo == nil || secret.WrapInfo.Token == "" {
 			return 0, fmt.Errorf("expected wrap token, got none")
 		}
 		token := secret.WrapInfo.Token
-		if err := os.WriteFile(s.Cfg.SecretIDFile, []byte(token), fs.FileMode(0o600)); err != nil {
-			return 0, err
-		}
 		s.Auth.Creds.SetWrappedSecretIDToken(token)
 		return time.Duration(secret.WrapInfo.TTL) * time.Second, nil
 	}
@@ -98,6 +89,7 @@ func (s *SecretIDRefresher) refreshOnce(ctx context.Context, rawTTL time.Duratio
 	if err != nil {
 		return 0, err
 	}
+	s.Log.Printf("secret-id: setting in-mem secret ID: %s", secretID)
 	s.Auth.Creds.SetInMemSecretID(secretID)
 	return time.Duration(ttlSec) * time.Second, nil
 }

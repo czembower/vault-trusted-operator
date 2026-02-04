@@ -1,9 +1,6 @@
-// cred_store.go
-package main
+package authmanager
 
 import (
-	"errors"
-	"os"
 	"strings"
 	"sync"
 )
@@ -50,30 +47,4 @@ func (c *CredStore) WrappedSecretIDToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.wrappedSecretIDToken
-}
-
-func (c *CredStore) LoadRoleIDFromFile(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	v := strings.TrimSpace(string(b))
-	if v == "" {
-		return errors.New("role-id file empty")
-	}
-	c.SetRoleID(v)
-	return nil
-}
-
-func (c *CredStore) LoadWrappedSecretIDTokenFromFile(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	v := strings.TrimSpace(string(b))
-	if v == "" {
-		return errors.New("secret-id file empty")
-	}
-	c.SetWrappedSecretIDToken(v)
-	return nil
 }

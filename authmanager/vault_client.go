@@ -1,15 +1,15 @@
-// vault_client.go
-package main
+package authmanager
 
 import (
 	"net/http"
 	"time"
+	"vault-trusted-operator/config"
 
 	vault "github.com/hashicorp/vault/api"
 )
 
 type VaultClientFactory struct {
-	Cfg       Config
+	Cfg       config.Config
 	HTTP      *http.Client
 	VaultAddr string
 }

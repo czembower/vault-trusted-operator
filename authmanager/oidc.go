@@ -1,5 +1,4 @@
-// oidc.go
-package main
+package authmanager
 
 import (
 	"bytes"
@@ -14,12 +13,13 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"vault-trusted-operator/config"
 
 	"github.com/skratchdot/open-golang/open"
 )
 
 type OIDCBootstrapper struct {
-	Cfg  Config
+	Cfg  config.Config
 	HTTP *http.Client
 	Log  *log.Logger
 }
