@@ -20,22 +20,31 @@ type SecretIDRefresher struct {
 // Run keeps an in-memory secret-id fresh by periodically requesting a new one.
 // This avoids forcing an interactive OIDC bootstrap if token renewal fails at an inconvenient time.
 func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
-	// Initial delay: try immediately
-	s.Log.Printf("secret-id: refresher running")
+	s.Log.Printf("auth: secret-id refresher running")
+
+	// Track current sleep timer for cleanup on context cancel
+	var currentTimer *time.Timer
+
 	for {
 		select {
 		case <-ctx.Done():
+			if currentTimer != nil {
+				currentTimer.Stop()
+			}
 			return
 		default:
 		}
 
-		ttl, err := s.refreshOnce(ctx, s.Cfg.InMemSecretTTL, nil, t) // raw secret-id (no wrapping)
+		ttl, err := s.RefreshOnce(ctx, s.Cfg.InMemSecretTTL, nil, t) // raw secret-id (no wrapping)
 		if err != nil {
 			s.Log.Printf("secret-id refresh failed: %v", err)
+			// Brief retry on failure
+			currentTimer = time.NewTimer(1 * time.Second)
 			select {
 			case <-ctx.Done():
+				currentTimer.Stop()
 				return
-			case <-time.After(1 * time.Second):
+			case <-currentTimer.C:
 				continue
 			}
 		}
@@ -45,30 +54,34 @@ func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
 			sleepFor = 1 * time.Second
 		}
 
-		s.Log.Printf("secret-id TTL: %s (refresh in %s)", ttl.String(), sleepFor.String())
+		s.Log.Printf("auth: secret-id TTL: %s (refresh in %s)", ttl.String(), sleepFor.String())
 
+		currentTimer = time.NewTimer(sleepFor)
 		select {
 		case <-ctx.Done():
+			currentTimer.Stop()
 			return
-		case <-time.After(sleepFor):
+		case <-currentTimer.C:
+			// Timer fired, loop continues to refresh
 		}
 	}
 }
 
 func (s *SecretIDRefresher) RefreshWrappedSecretID(ctx context.Context, t *TokenProvider) error {
-	_, err := s.refreshOnce(ctx, s.Cfg.WrapTTL, &s.Cfg.WrapTTL, t) // wrapped token output, stored in CredStore
+	_, err := s.RefreshOnce(ctx, s.Cfg.WrapTTL, &s.Cfg.WrapTTL, t) // wrapped token output, stored in CredStore
 	return err
 }
 
-func (s *SecretIDRefresher) refreshOnce(ctx context.Context, rawTTL time.Duration, wrapTTL *time.Duration, t *TokenProvider) (time.Duration, error) {
-	s.Log.Printf("secret-id: refresh once triggered")
+// RefreshOnce performs a single secret ID refresh operation.
+// If wrapTTL is nil, returns a raw secret ID; if non-nil, returns a wrapped token.
+func (s *SecretIDRefresher) RefreshOnce(ctx context.Context, rawTTL time.Duration, wrapTTL *time.Duration, t *TokenProvider) (time.Duration, error) {
 	payload := map[string]any{}
 	if wrapTTL == nil {
 		// raw secret-id request includes a TTL
 		payload["ttl"] = int(rawTTL.Seconds())
 	}
 
-	secret, err := vaultWriteWithReauth(ctx, s.Auth, s.Cfg.AppRoleSecretIDPath(), payload, wrapTTL, t, s)
+	secret, err := vaultWriteWithReauth(ctx, s.Auth, s.Cfg.AppRoleSecretIDPath(), payload, wrapTTL, t)
 
 	if err != nil {
 		return 0, err
@@ -89,7 +102,7 @@ func (s *SecretIDRefresher) refreshOnce(ctx context.Context, rawTTL time.Duratio
 	if err != nil {
 		return 0, err
 	}
-	s.Log.Printf("secret-id: setting in-mem secret ID: %s", secretID)
+	s.Log.Printf("auth: obtained fresh secret ID (TTL: %d seconds)", ttlSec)
 	s.Auth.Creds.SetInMemSecretID(secretID)
 	return time.Duration(ttlSec) * time.Second, nil
 }

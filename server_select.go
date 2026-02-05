@@ -4,7 +4,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -66,10 +66,12 @@ func (s *ServerSelector) probe(ctx context.Context, addr string) (time.Duration,
 	start := time.Now()
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
-		log.Printf("Error: %v\n", err)
 		return 0, false
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	// Consume and discard body to ensure proper connection reuse
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 
 	if !s.AcceptStatus[resp.StatusCode] {
 		return 0, false

@@ -42,7 +42,7 @@ func (s *Server) routes(cfg Config, t *authmanager.TokenProvider) {
 	s.Mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		address := fmt.Sprintf("%p", t)
 		writeJSON(w, http.StatusOK, TokenResponse{
-			Token:   t.GetToken()[:20] + "...",
+			Token:   authmanager.TokenPrefix(t.GetToken()),
 			Address: address,
 		})
 	})

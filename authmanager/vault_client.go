@@ -2,7 +2,6 @@ package authmanager
 
 import (
 	"net/http"
-	"time"
 	"vault-trusted-operator/config"
 
 	vault "github.com/hashicorp/vault/api"
@@ -30,7 +29,5 @@ func (f *VaultClientFactory) New() (*vault.Client, error) {
 	client.SetReadYourWrites(true)
 	client.SetClientTimeout(f.Cfg.ClientTimeout)
 
-	// Ensure per-request timeouts are respected by HttpClient too.
-	_ = time.Second // placeholder to keep time imported if you expand this
 	return client, nil
 }

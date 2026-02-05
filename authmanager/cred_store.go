@@ -2,49 +2,70 @@ package authmanager
 
 import (
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
-type CredStore struct {
-	mu sync.RWMutex
-
+type credSnapshot struct {
 	roleID               string
 	inMemSecretID        string
 	wrappedSecretIDToken string
 }
 
+type CredStore struct {
+	creds atomic.Value // *credSnapshot
+}
+
 func (c *CredStore) SetRoleID(v string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.roleID = strings.TrimSpace(v)
+	v = strings.TrimSpace(v)
+	c.updateCreds(func(s *credSnapshot) {
+		s.roleID = v
+	})
 }
 
 func (c *CredStore) RoleID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.roleID
+	return c.getSnapshot().roleID
 }
 
 func (c *CredStore) SetInMemSecretID(v string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.inMemSecretID = strings.TrimSpace(v)
+	v = strings.TrimSpace(v)
+	c.updateCreds(func(s *credSnapshot) {
+		s.inMemSecretID = v
+	})
 }
 
 func (c *CredStore) InMemSecretID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.inMemSecretID
+	return c.getSnapshot().inMemSecretID
 }
 
 func (c *CredStore) SetWrappedSecretIDToken(v string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.wrappedSecretIDToken = strings.TrimSpace(v)
+	v = strings.TrimSpace(v)
+	c.updateCreds(func(s *credSnapshot) {
+		s.wrappedSecretIDToken = v
+	})
 }
 
 func (c *CredStore) WrappedSecretIDToken() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.wrappedSecretIDToken
+	return c.getSnapshot().wrappedSecretIDToken
+}
+
+// getSnapshot returns the current credential snapshot, creating an empty one if needed.
+func (c *CredStore) getSnapshot() *credSnapshot {
+	v := c.creds.Load()
+	if v == nil {
+		return &credSnapshot{}
+	}
+	return v.(*credSnapshot)
+}
+
+// updateCreds atomically updates credentials using a copy-on-write pattern.
+func (c *CredStore) updateCreds(fn func(*credSnapshot)) {
+	old := c.getSnapshot()
+	// Create a shallow copy
+	new := &credSnapshot{
+		roleID:               old.roleID,
+		inMemSecretID:        old.inMemSecretID,
+		wrappedSecretIDToken: old.wrappedSecretIDToken,
+	}
+	fn(new)
+	c.creds.Store(new)
 }

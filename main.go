@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -57,11 +56,6 @@ func main() {
 					st.RoleID != "",
 					st.WrappedSecretIDToken != "",
 				)
-				b, err := json.MarshalIndent(st, "", "  ")
-				if err != nil {
-					logger.Fatalf("failed to marshal decrypted state for debug: %v", err)
-				}
-				logger.Printf("DEBUG: decrypted state payload:\n%s", string(b))
 			}
 			// Use persisted config as the source of truth on subsequent runs.
 			cfg = st.Config
@@ -129,6 +123,7 @@ func main() {
 	if _, err := auth.Client(ctx, &t); err != nil {
 		logger.Fatalf("initial auth failed: %v\nReconfiguration is required.", err)
 	}
+
 	// Keep a fresh in-memory SecretID so that if token renewal ever fails,
 	// we can re-login without forcing interactive OIDC in the background.
 	secretIDRefresher := &authmanager.SecretIDRefresher{
@@ -136,7 +131,8 @@ func main() {
 		Log:  logger,
 		Auth: auth,
 	}
-
+	// Wire the refresher into the auth manager for proactive reauth
+	auth.SIDRefr = secretIDRefresher
 	go secretIDRefresher.Run(ctx, &t)
 
 	brokerCfg := broker.DefaultConfig()

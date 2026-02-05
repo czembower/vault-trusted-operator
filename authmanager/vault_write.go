@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -19,7 +20,6 @@ func vaultWriteWithReauth(
 	payload map[string]any,
 	wrapTTL *time.Duration,
 	t *TokenProvider,
-	s *SecretIDRefresher,
 ) (*vault.Secret, error) {
 
 	// attempt #1
@@ -92,43 +92,20 @@ func isTokenRejected(err error) bool {
 		return false
 	}
 
-	// RawRequestWithContext errors often wrap a ResponseError
+	// Check for Vault ResponseError with 401/403 status
 	var re *vault.ResponseError
-	if ok := asResponseError(err, &re); ok {
-		if re.StatusCode == 401 || re.StatusCode == 403 {
-			// Try to distinguish "token rejected" from genuine ACL denial.
-			// NOTE: Vault returns 403 for both bad token and policy denial.
-			// If you want to reauth only on "bad token", check message text.
-			msg := strings.ToLower(strings.Join(re.Errors, " "))
-			if strings.Contains(msg, "bad token") ||
-				strings.Contains(msg, "missing client token") ||
-				strings.Contains(msg, "permission denied") {
-				return true
-			}
-		}
+	if !errors.As(err, &re) {
+		return false
 	}
-	return false
-}
 
-// Go doesn't have errors.As for non-stdlib constraints? It does; use errors.As.
-// This helper exists so you can keep the calling code tidy.
-func asResponseError(err error, target **vault.ResponseError) bool {
-	// standard library
-	// return errors.As(err, target)
-
-	// If you already use errors.As elsewhere, just use that directly.
-	// Included explicitly here to avoid ambiguity in the snippet.
-	type aser interface{ Unwrap() error }
-	for err != nil {
-		if re, ok := err.(*vault.ResponseError); ok {
-			*target = re
-			return true
-		}
-		u, ok := err.(aser)
-		if !ok {
-			break
-		}
-		err = u.Unwrap()
+	if re.StatusCode != 401 && re.StatusCode != 403 {
+		return false
 	}
-	return false
+
+	// Try to distinguish "token rejected" from genuine ACL denial.
+	// NOTE: Vault returns 403 for both bad token and policy denial.
+	msg := strings.ToLower(strings.Join(re.Errors, " "))
+	return strings.Contains(msg, "bad token") ||
+		strings.Contains(msg, "missing client token") ||
+		strings.Contains(msg, "permission denied")
 }
