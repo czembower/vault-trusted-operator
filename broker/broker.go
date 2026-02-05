@@ -25,6 +25,10 @@ type Config struct {
 	VaultNamespace  string
 	VaultSkipVerify bool
 	Logger          *log.Logger
+
+	// Access control: allowed peer process UIDs and GIDs
+	AllowedUIDs []uint32
+	AllowedGIDs []uint32
 }
 
 // Provider hides OS/build-specific listener creation.
@@ -69,6 +73,8 @@ func NewServer(cfg Config, t *authmanager.TokenProvider) *Server {
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		},
 		ShutdownTimeout: cfg.ShutdownTimeout,
+		AllowedUIDs:     cfg.AllowedUIDs,
+		AllowedGIDs:     cfg.AllowedGIDs,
 		start:           time.Now(),
 	}
 	s.routes(cfg, t)

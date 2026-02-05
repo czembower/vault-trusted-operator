@@ -16,6 +16,8 @@ type Server struct {
 	HTTP            *http.Server
 	Mux             *http.ServeMux
 	ShutdownTimeout time.Duration
+	AllowedUIDs     []uint32
+	AllowedGIDs     []uint32
 	start           time.Time
 }
 
@@ -51,6 +53,15 @@ func (s *Server) routes(cfg Config, t *authmanager.TokenProvider) {
 }
 
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// Wrap listener with access control if needed
+	if len(s.AllowedUIDs) > 0 || len(s.AllowedGIDs) > 0 {
+		ln = &accessControlListener{
+			Listener:    ln,
+			allowedUIDs: s.AllowedUIDs,
+			allowedGIDs: s.AllowedGIDs,
+		}
+	}
+
 	errc := make(chan error, 1)
 	go func() { errc <- s.HTTP.Serve(ln) }()
 
@@ -97,4 +108,45 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ContextKey for storing peer credentials in request context
+type contextKey string
+
+const peerCredsContextKey contextKey = "peerCreds"
+
+// accessControlListener wraps a listener and enforces access control at connection time.
+type accessControlListener struct {
+	net.Listener
+	allowedUIDs []uint32
+	allowedGIDs []uint32
+}
+
+// Accept accepts a connection and validates peer credentials if access control is configured.
+func (acl *accessControlListener) Accept() (net.Conn, error) {
+	conn, err := acl.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to get peer credentials (only works for Unix sockets on Linux)
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		// Not a Unix socket; allow (Windows named pipe or loopback TCP)
+		return conn, nil
+	}
+
+	creds := GetPeerCreds(unixConn)
+	if creds == nil {
+		// No credentials available; allow (platform doesn't support peer credentials)
+		return conn, nil
+	}
+
+	// Validate credentials against whitelist
+	if err := CheckAccessControl(creds, acl.allowedUIDs, acl.allowedGIDs); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("peer access denied: %w", err)
+	}
+
+	return conn, nil
 }

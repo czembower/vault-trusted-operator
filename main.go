@@ -143,6 +143,12 @@ func main() {
 	brokerCfg.VaultNamespace = cfg.Namespace
 	brokerCfg.VaultSkipVerify = cfg.InsecureTLS
 	brokerCfg.Logger = logger
+	brokerCfg.AllowedUIDs = cfg.AllowedUIDs
+	brokerCfg.AllowedGIDs = cfg.AllowedGIDs
+
+	if len(cfg.AllowedUIDs) > 0 || len(cfg.AllowedGIDs) > 0 {
+		logger.Printf("broker: access control enabled - UIDs: %v, GIDs: %v", cfg.AllowedUIDs, cfg.AllowedGIDs)
+	}
 
 	if err := broker.Run(ctx, brokerCfg, &t); err != nil && err != context.Canceled {
 		logger.Fatalf("broker stopped: %v", err)

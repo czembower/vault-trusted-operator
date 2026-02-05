@@ -47,6 +47,12 @@ type Config struct {
 	PipeName   string
 	SocketPath string
 	SocketMode uint
+
+	// Broker access controls
+	AllowedUIDs    []uint32
+	AllowedUIDsCSV string
+	AllowedGIDs    []uint32
+	AllowedGIDsCSV string
 }
 
 func MustLoadConfig() Config {
@@ -79,11 +85,20 @@ func MustLoadConfig() Config {
 	flag.UintVar(&cfg.SocketMode, "socket-mode", 0600, "Unix socket file mode for broker/proxy service")
 	flag.StringVar(&cfg.PipeName, "pipe-path", "./pipe", "Windows named pipe name for broker/proxy service")
 	flag.BoolVar(&cfg.Debug, "debug", envBool("DEBUG", false), "Print verbose debugging logs")
-	flag.Parse()
+	flag.StringVar(&cfg.AllowedUIDsCSV, "allowed-uids", envOr("BROKER_ALLOWED_UIDS", ""), "Comma-separated list of allowed user IDs for broker access (e.g., 1000,1001)")
+	flag.StringVar(&cfg.AllowedGIDsCSV, "allowed-gids", envOr("BROKER_ALLOWED_GIDS", ""), "Comma-separated list of allowed group IDs for broker access (e.g., 100,101)")
 
 	cfg.StateFile = mustAbs(cfg.StateFile)
 	cfg.ProbeTimeout = envDuration("VAULT_PROBE_TIMEOUT", 2*time.Second)
 	cfg.ClientTimeout = envDuration("VAULT_CLIENT_TIMEOUT", 2*time.Second)
+
+	// Parse broker access control lists
+	if cfg.AllowedUIDsCSV != "" {
+		cfg.AllowedUIDs = parseUintList(cfg.AllowedUIDsCSV)
+	}
+	if cfg.AllowedGIDsCSV != "" {
+		cfg.AllowedGIDs = parseUintList(cfg.AllowedGIDsCSV)
+	}
 
 	wrapTTL, err := parseFlexibleDuration(cfg.WrapTTLRaw)
 	if err != nil {
@@ -235,4 +250,26 @@ func (c Config) AppRoleSecretIDPath() string {
 
 func (c Config) AppRoleRoleIDPath() string {
 	return fmt.Sprintf("%s/role/%s/role-id", strings.TrimPrefix(c.AppRoleMount, "/"), c.AppRoleRole)
+}
+
+func parseUintList(s string) []uint32 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var result []uint32
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(p, 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: invalid uint in list %q: %v\n", s, err)
+			continue
+		}
+		result = append(result, uint32(v))
+	}
+	return result
 }
