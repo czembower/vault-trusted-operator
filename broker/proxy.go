@@ -12,7 +12,6 @@ import (
 )
 
 func NewVaultReverseProxy(cfg Config, t *authmanager.TokenProvider) (*httputil.ReverseProxy, error) {
-	cfg.Logger.Printf("proxy: starting")
 	upstreamURL, err := url.Parse(cfg.VaultAddress)
 	if err != nil {
 		return nil, err
@@ -59,8 +58,9 @@ func NewVaultReverseProxy(cfg Config, t *authmanager.TokenProvider) (*httputil.R
 		req.Header.Set("PROXY-VIA", "go-vault-proxy")
 	}
 
-	// Ensure errors are returned cleanly.
+	// Ensure errors are returned cleanly and logged.
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		cfg.Logger.Printf("ERROR: proxy upstream request failed: %s %s: %v", r.Method, r.URL.Path, err)
 		// Avoid leaking internal details.
 		http.Error(w, "proxy: upstream error", http.StatusBadGateway)
 	}

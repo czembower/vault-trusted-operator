@@ -65,7 +65,9 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 	// 1) Prefer: in-memory secret-id
 	if roleID != "" {
 		if sid := a.Creds.InMemSecretID(); sid != "" {
-			a.Log.Printf("auth: using in-memory secret-id")
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: using in-memory secret-id")
+			}
 			return a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: sid}, false)
 		}
 	}
@@ -73,7 +75,9 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 	// 2) Next: wrapped secret-id token from *state*
 	if roleID != "" {
 		if wrapTok := a.Creds.WrappedSecretIDToken(); wrapTok != "" {
-			a.Log.Printf("auth: using wrapped secret-id token from state")
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: using wrapped secret-id token from state")
+			}
 			// IMPORTANT: WithWrappingToken expects the SecretID to be the WRAPPING TOKEN
 			return a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
 		}
@@ -84,7 +88,7 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 		return nil, errors.New("no secret-id available and oidc-role is not set (cannot bootstrap)")
 	}
 
-	a.Log.Printf("auth: no usable secret-id; bootstrapping via OIDC")
+	a.Log.Printf("INFO: auth: bootstrapping via OIDC (interactive)")
 	rid, sid, err := a.OIDC.Bootstrap(ctx, client.Address())
 	if err != nil {
 		return nil, err
@@ -96,7 +100,9 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 }
 
 func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client, roleID string, sid approle.SecretID, wrapped bool) (*vault.Secret, error) {
-	a.Log.Printf("auth: attempting AppRole login")
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: auth: attempting AppRole login")
+	}
 	var opts []approle.LoginOption
 	if wrapped {
 		opts = append(opts, approle.WithWrappingToken())
@@ -105,6 +111,8 @@ func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client
 	if err != nil {
 		return nil, err
 	}
+
+	// Use the standard Login method, which internally makes the correct request
 	secret, err := client.Auth().Login(ctx, ar)
 	if err != nil {
 		return nil, fmt.Errorf("vault AppRole login failed: %w", err)
@@ -118,7 +126,9 @@ func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client
 func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secret, t *TokenProvider) {
 	// Stop prior watcher if any
 	if a.watcherCancel != nil {
-		a.Log.Printf("watcher: canceling stale watcher")
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: watcher: canceling stale watcher")
+		}
 		a.watcherCancel()
 		a.watcherCancel = nil
 	}
@@ -127,7 +137,9 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 	a.watcherCancel = cancel
 	a.watcherErr = nil
 
-	a.Log.Printf("watcher: new lifetime watcher starting")
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: watcher: new lifetime watcher starting")
+	}
 	w, err := client.NewLifetimeWatcher(&vault.LifetimeWatcherInput{
 		Secret: loginSecret,
 	})
@@ -138,17 +150,23 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 
 	ttl, _ := loginSecret.TokenTTL()
 	renewable, _ := loginSecret.TokenIsRenewable()
-	a.Log.Printf("watcher: token TTL: %s | renewable: %t", ttl, renewable)
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: watcher: token TTL: %s | renewable: %t", ttl, renewable)
+	}
 
 	// Store token with expiry info for batch token detection
 	t.SetTokenWithExpiry(client.Token(), ttl, renewable)
-	a.Log.Printf("watcher: set token: %s", TokenPrefix(t.GetToken()))
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: watcher: set token: %s", TokenPrefix(t.GetToken()))
+	}
 
 	// For non-renewable (batch) tokens, trigger early refresh
 	if !renewable {
 		// Refresh at 2/3 of TTL to ensure we get a new secret ID before expiry
 		refreshAt := time.Duration(float64(ttl) * 2 / 3)
-		a.Log.Printf("watcher: non-renewable token detected; scheduling refresh in %v", refreshAt)
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: watcher: non-renewable token detected; scheduling refresh in %v", refreshAt)
+		}
 
 		timer := time.NewTimer(refreshAt)
 		go func() {
@@ -157,9 +175,11 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 			case <-wctx.Done():
 				return
 			case <-timer.C:
-				a.Log.Printf("watcher: batch token TTL threshold reached, performing proactive re-auth")
+				if a.Cfg.Debug {
+					a.Log.Printf("DEBUG: watcher: batch token TTL threshold reached, performing proactive re-auth")
+				}
 				// Perform re-authentication in the background
-				a.performProactiveReauth(client, t)
+				a.performProactiveReauth(t)
 			}
 		}()
 		return
@@ -170,7 +190,9 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 		go w.Start()
 		select {
 		case <-wctx.Done():
-			a.Log.Printf("watcher: done")
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: watcher: done")
+			}
 			w.Stop()
 			return
 		case err := <-w.DoneCh():
@@ -185,7 +207,9 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 			for {
 				select {
 				case <-wctx.Done():
-					a.Log.Printf("watcher: renew phase done")
+					if a.Cfg.Debug {
+						a.Log.Printf("DEBUG: watcher: renew phase done")
+					}
 					w.Stop()
 					return
 				case err := <-w.DoneCh():
@@ -198,7 +222,9 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 				case <-w.RenewCh():
 					// Token was renewed by the watcher
 					t.SetTokenWithExpiry(client.Token(), ttl, true)
-					a.Log.Printf("authmanager: renewed token: %s address: %p", TokenPrefix(t.GetToken()), t)
+					if a.Cfg.Debug {
+						a.Log.Printf("DEBUG: authmanager: renewed token: %s address: %p", TokenPrefix(t.GetToken()), t)
+					}
 				}
 			}
 		}
@@ -206,7 +232,9 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 }
 
 func (a *AuthManager) ForceReauth() {
-	a.Log.Printf("auth: attempting reauth")
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: auth: attempting reauth")
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -220,7 +248,7 @@ func (a *AuthManager) ForceReauth() {
 
 // performProactiveReauth attempts to re-authenticate without holding the main lock.
 // This is called when batch tokens approach expiry.
-func (a *AuthManager) performProactiveReauth(oldClient *vault.Client, t *TokenProvider) {
+func (a *AuthManager) performProactiveReauth(t *TokenProvider) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -228,23 +256,29 @@ func (a *AuthManager) performProactiveReauth(oldClient *vault.Client, t *TokenPr
 	// This is critical for batch tokens with single-use secret IDs.
 	if a.SIDRefr != nil {
 		if _, err := a.SIDRefr.RefreshOnce(ctx, a.Cfg.InMemSecretTTL, nil, t); err != nil {
-			a.Log.Printf("proactive reauth: failed to refresh secret ID: %v (proceeding with existing)", err)
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: failed to refresh secret ID: %v (proceeding with existing)", err)
+			}
 			// Fall through - attempt login with whatever secret ID we have
-		} else {
-			a.Log.Printf("proactive reauth: obtained fresh secret ID")
+		} else if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: obtained fresh secret ID")
 		}
 	}
 
 	newClient, err := a.Clients.New()
 	if err != nil {
-		a.Log.Printf("proactive reauth: failed to create client: %v", err)
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: failed to create client: %v", err)
+		}
 		a.ForceReauth()
 		return
 	}
 
 	secret, err := a.login(ctx, newClient)
 	if err != nil {
-		a.Log.Printf("proactive reauth: login failed: %v", err)
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: login failed: %v", err)
+		}
 		a.ForceReauth()
 		return
 	}
@@ -259,14 +293,18 @@ func (a *AuthManager) performProactiveReauth(oldClient *vault.Client, t *TokenPr
 		a.watcherCancel = nil
 	}
 
-	a.Log.Printf("proactive reauth: successfully authenticated new token")
+	if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: auth: successfully authenticated new token")
+	}
 	a.startWatcher(newClient, secret, t)
 	a.client = newClient
 	a.watcherErr = nil
 }
 
 func (a *AuthManager) Stop() {
-	a.Log.Printf("auth: stopping")
+	if a.Cfg.Debug {
+		a.Log.Printf("INFO: auth: stopping")
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.watcherCancel != nil {

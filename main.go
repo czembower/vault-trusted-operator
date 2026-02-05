@@ -43,25 +43,26 @@ func main() {
 	if err != nil {
 		logger.Fatalf("keystore %s: %v", kp.Name(), err)
 	}
-	logger.Printf("keystore: %s", kp.Name())
+	logger.Printf("INFO: keystore: %s", kp.Name())
 	aad := []byte(getUniqueID())
 	var st StatePayload
 
 	if !cfg.Reconfigure {
 		if err := LoadSealedState(cfg.StateFile, key, &st, aad); err == nil {
 			if debug {
-				logger.Printf("state file=%s", cfg.StateFile)
-				logger.Printf("state key=%s", cfg.StateKeyFile)
-				logger.Printf("loading state: role_id_present=%t wrapped_token_present=%t",
+				logger.Printf("DEBUG: state file=%s", cfg.StateFile)
+				logger.Printf("DEBUG: state key=%s", cfg.StateKeyFile)
+				logger.Printf("DEBUG: loading state: role_id_present=%t wrapped_token_present=%t",
 					st.RoleID != "",
 					st.WrappedSecretIDToken != "",
 				)
 			}
+			// Note: SaveCount should be checked here for rollback detection if needed
 			// Use persisted config as the source of truth on subsequent runs.
 			cfg = st.Config
-			logger.Printf("config: loaded sealed state from %s", cfg.StateFile)
+			logger.Printf("INFO: config: loaded sealed state from %s", cfg.StateFile)
 			if SetFlagNamesCSV() != "" {
-				logger.Printf("WARN: ignored command line arguments due to present state file: %v", SetFlagNamesCSV())
+				logger.Printf("INFO: WARN: ignored command line arguments due to present state file: %v", SetFlagNamesCSV())
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			logger.Fatalf("failed to load sealed state file: %v", err)
@@ -75,10 +76,11 @@ func main() {
 		if err := SaveSealedState(cfg.StateFile, key, &st, aad); err != nil {
 			logger.Fatalf("failed to write initial sealed state file: %v", err)
 		}
-		logger.Printf("wrote initial sealed state to %s", cfg.StateFile)
+		logger.Printf("INFO: wrote initial sealed state to %s", cfg.StateFile)
 	}
 
 	cfg.Reconfigure = reconfigure
+	cfg.Debug = debug
 	httpc := NewHTTPClient(cfg)
 
 	selector := &ServerSelector{
@@ -94,7 +96,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("no usable Vault address: %v", err)
 	}
-	logger.Printf("config: using Vault server: %s", primary)
+	logger.Printf("INFO: config: using Vault server: %s", primary)
 
 	creds := &authmanager.CredStore{}
 	if st.RoleID != "" {
@@ -133,6 +135,27 @@ func main() {
 	}
 	// Wire the refresher into the auth manager for proactive reauth
 	auth.SIDRefr = secretIDRefresher
+
+	// Acquire and store a fresh wrapped secret ID immediately after successful initialization.
+	// This serves as a fallback during outages - if in-memory refresh fails and proactive reauth
+	// needs a secret ID, we have a more recent one than the bootstrap token (which was invalidated).
+	if err := secretIDRefresher.RefreshWrappedSecretID(ctx, &t); err != nil {
+		logger.Printf("WARN: failed to acquire initial wrapped secret ID: %v (will retry at shutdown)", err)
+	} else if cfg.Debug {
+		logger.Printf("DEBUG: acquired post-init wrapped secret ID")
+	}
+
+	// Persist the post-initialization wrapped secret ID to state immediately.
+	// This ensures if the process crashes before shutdown, we still have a recent fallback token.
+	if wrappedToken := creds.WrappedSecretIDToken(); wrappedToken != "" {
+		st.WrappedSecretIDToken = wrappedToken
+		if err := SaveSealedState(cfg.StateFile, key, &st, aad); err != nil {
+			logger.Printf("WARN: failed to persist post-init wrapped secret ID: %v", err)
+		} else if cfg.Debug {
+			logger.Printf("DEBUG: persisted post-init wrapped secret ID to state")
+		}
+	}
+
 	go secretIDRefresher.Run(ctx, &t)
 
 	brokerCfg := broker.DefaultConfig()
@@ -143,36 +166,44 @@ func main() {
 	brokerCfg.VaultNamespace = cfg.Namespace
 	brokerCfg.VaultSkipVerify = cfg.InsecureTLS
 	brokerCfg.Logger = logger
+	brokerCfg.Debug = cfg.Debug
 	brokerCfg.AllowedUIDs = cfg.AllowedUIDs
 	brokerCfg.AllowedGIDs = cfg.AllowedGIDs
+	brokerCfg.HTTPAddr = cfg.HTTPAddr
 
 	if len(cfg.AllowedUIDs) > 0 || len(cfg.AllowedGIDs) > 0 {
-		logger.Printf("broker: access control enabled - UIDs: %v, GIDs: %v", cfg.AllowedUIDs, cfg.AllowedGIDs)
+		logger.Printf("INFO: broker: access control enabled - UIDs: %v, GIDs: %v", cfg.AllowedUIDs, cfg.AllowedGIDs)
 	}
 
 	if err := broker.Run(ctx, brokerCfg, &t); err != nil && err != context.Canceled {
 		logger.Fatalf("broker stopped: %v", err)
 	}
 
-	logger.Printf("running; press ctrl+c to exit")
+	logger.Printf("INFO: running; press ctrl+c to exit")
 
 	<-ctx.Done()
 
 	// On shutdown: write a wrapped secret-id token to state (so a service can restart non-interactively).
-	logger.Println("maint: shutting down...")
+	logger.Println("INFO: maint: shutting down...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+
+	// Invalidate the post-initialization wrapped token (if still present) to prevent credential reuse.
+	// This unwraps the token and consumes the secret ID, ensuring the wrapped token cannot be used again.
+	if postInitToken := creds.WrappedSecretIDToken(); postInitToken != "" {
+		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, postInitToken, &t)
+	}
 
 	// Get a fresh wrapped token at exit (stored in CredStore)
 	if err := secretIDRefresher.RefreshWrappedSecretID(shutdownCtx, &t); err != nil {
 		logger.Fatalf("config: failed to refresh wrapped secret-id token: %v", err)
 	} else {
-		logger.Printf("config: stored wrapped secret-id token with TTL %s", cfg.WrapTTL)
+		logger.Printf("INFO: config: stored wrapped secret-id token with TTL %s", cfg.WrapTTL)
 	}
 
 	// Persist everything into the state
-	logger.Printf("config: saving sealed state data")
+	logger.Printf("INFO: config: saving sealed state data")
 	st.Config = cfg
 	st.RoleID = creds.RoleID()
 	st.WrappedSecretIDToken = creds.WrappedSecretIDToken()
@@ -181,7 +212,9 @@ func main() {
 	if err := SaveSealedState(cfg.StateFile, key, &st, aad); err != nil {
 		logger.Fatalf("failed to save sealed state: %v", err)
 	}
-	logger.Println("done")
+	// Zero the encryption key from memory now that state has been saved
+	ZeroBytes(key)
+	logger.Println("INFO: done")
 }
 
 func SetFlagNamesCSV() string {
@@ -210,5 +243,11 @@ func getUniqueID() string {
 		log.Fatal(err)
 	}
 
-	return self.Info().Architecture + "-" + self.Info().OS.Platform + "-" + self.Info().UniqueID
+	// Build host-specific AAD binding: hostname is stable, doesn't change with OS updates
+	// This ensures state is bound to the host it was created on
+	hostname, _ := os.Hostname()
+
+	// Format: architecture-platform-uniqueID-hostname
+	// Provides defense-in-depth by binding state to the specific host machine
+	return self.Info().Architecture + "-" + self.Info().OS.Platform + "-" + self.Info().UniqueID + "-" + hostname
 }

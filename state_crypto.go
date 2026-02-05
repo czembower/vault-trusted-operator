@@ -25,6 +25,7 @@ type SealedStateFile struct {
 	CipherB64 string    `json:"cipher_b64"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	SaveCount uint64    `json:"save_count"` // Monotonic counter for rollback detection
 }
 
 type StatePayload struct {
@@ -101,11 +102,13 @@ func SaveSealedState(statePath string, key []byte, payload any, aad []byte) erro
 		UpdatedAt: now,
 	}
 
-	// preserve CreatedAt if file exists
+	// preserve CreatedAt and increment SaveCount if file exists
 	if existing, err := LoadSealedEnvelope(statePath); err == nil && !existing.CreatedAt.IsZero() {
 		env.CreatedAt = existing.CreatedAt
+		env.SaveCount = existing.SaveCount + 1
 	} else {
 		env.CreatedAt = now
+		env.SaveCount = 1
 	}
 
 	out, err := json.MarshalIndent(env, "", "  ")
@@ -184,4 +187,12 @@ func bytesTrimSpace(b []byte) []byte {
 		j--
 	}
 	return b[i:j]
+}
+
+// ZeroBytes securely overwrites a byte slice with zeros to minimize key exposure time in memory.
+// This should be called after sensitive material (like encryption keys) is no longer needed.
+func ZeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }

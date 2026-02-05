@@ -9,6 +9,7 @@ import (
 	"vault-trusted-operator/config"
 
 	vault "github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/api/auth/approle"
 )
 
 type SecretIDRefresher struct {
@@ -19,11 +20,16 @@ type SecretIDRefresher struct {
 
 // Run keeps an in-memory secret-id fresh by periodically requesting a new one.
 // This avoids forcing an interactive OIDC bootstrap if token renewal fails at an inconvenient time.
+// Uses exponential backoff on upstream unavailability to avoid cascade failures.
 func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
-	s.Log.Printf("auth: secret-id refresher running")
+	if s.Cfg.Debug {
+		s.Log.Printf("DEBUG: auth: secret-id refresher running")
+	}
 
 	// Track current sleep timer for cleanup on context cancel
 	var currentTimer *time.Timer
+	consecutiveFailures := 0
+	maxBackoff := 5 * time.Minute
 
 	for {
 		select {
@@ -35,11 +41,22 @@ func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
 		default:
 		}
 
-		ttl, err := s.RefreshOnce(ctx, s.Cfg.InMemSecretTTL, nil, t) // raw secret-id (no wrapping)
+		ttl, err := s.RefreshOnce(ctx, s.Cfg.CredTTL, nil, t) // raw secret-id (no wrapping)
 		if err != nil {
-			s.Log.Printf("secret-id refresh failed: %v", err)
-			// Brief retry on failure
-			currentTimer = time.NewTimer(1 * time.Second)
+			consecutiveFailures++
+			if s.Cfg.Debug {
+				s.Log.Printf("DEBUG: auth: secret-id refresh failed (attempt %d): %v", consecutiveFailures, err)
+			}
+			// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s (5m cap)
+			// This prevents cascading failures when upstream is temporarily unavailable
+			backoffDuration := time.Duration(1<<uint(consecutiveFailures-1)) * 1 * time.Second
+			if backoffDuration > maxBackoff {
+				backoffDuration = maxBackoff
+			}
+			if s.Cfg.Debug {
+				s.Log.Printf("DEBUG: auth: backing off %v before next refresh attempt", backoffDuration)
+			}
+			currentTimer = time.NewTimer(backoffDuration)
 			select {
 			case <-ctx.Done():
 				currentTimer.Stop()
@@ -49,12 +66,17 @@ func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
 			}
 		}
 
+		// Reset backoff counter on successful refresh
+		consecutiveFailures = 0
+
 		sleepFor := time.Duration(float64(ttl) * s.Cfg.RenewFraction)
 		if sleepFor < 1*time.Second {
 			sleepFor = 1 * time.Second
 		}
 
-		s.Log.Printf("auth: secret-id TTL: %s (refresh in %s)", ttl.String(), sleepFor.String())
+		if s.Cfg.Debug {
+			s.Log.Printf("DEBUG: auth: secret-id TTL: %s (refresh in %s)", ttl.String(), sleepFor.String())
+		}
 
 		currentTimer = time.NewTimer(sleepFor)
 		select {
@@ -102,7 +124,9 @@ func (s *SecretIDRefresher) RefreshOnce(ctx context.Context, rawTTL time.Duratio
 	if err != nil {
 		return 0, err
 	}
-	s.Log.Printf("auth: obtained fresh secret ID (TTL: %d seconds)", ttlSec)
+	if s.Cfg.Debug {
+		s.Log.Printf("DEBUG: auth: obtained fresh secret ID (TTL: %d seconds)", ttlSec)
+	}
 	s.Auth.Creds.SetInMemSecretID(secretID)
 	return time.Duration(ttlSec) * time.Second, nil
 }
@@ -132,6 +156,35 @@ func parseSecretIDResponse(secret *vault.Secret) (secretID string, ttlSec int64,
 		return "", 0, fmt.Errorf("could not parse secret_id_ttl: %#v", vTTL)
 	}
 	return secretID, ttlSec, nil
+}
+
+// InvalidateWrappedSecretID unwraps the given wrapped token by using it to authenticate to Vault.
+// This invalidates the single-use wrapped token, ensuring it cannot be reused.
+// If the token is empty or authentication fails, the error is logged as a warning and the function returns gracefully.
+func (s *SecretIDRefresher) InvalidateWrappedSecretID(ctx context.Context, wrappedToken string, t *TokenProvider) {
+	if wrappedToken == "" {
+		return // No token to invalidate
+	}
+
+	s.Log.Printf("INFO: auth: invalidating wrapped secret ID token")
+
+	// Create a client to authenticate with the wrapped token
+	client, err := s.Auth.Clients.New()
+	if err != nil {
+		s.Log.Printf("WARN: auth: failed to create Vault client for token invalidation: %v", err)
+		return
+	}
+
+	// Use the wrapped token to authenticate via AppRole login with wrapped=true.
+	// This unwraps the token and consumes the single-use credential.
+	_, err = s.Auth.loginWithAppRole(ctx, client, s.Auth.Creds.RoleID(), approle.SecretID{FromString: wrappedToken}, true)
+	if err != nil {
+		s.Log.Printf("WARN: auth: failed to invalidate wrapped token: %v", err)
+		return
+	}
+
+	// Token was successfully consumed
+	s.Log.Printf("INFO: auth: post-init wrapped secret ID invalidated successfully")
 }
 
 func asInt64(v any) (int64, bool) {

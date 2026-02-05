@@ -30,7 +30,7 @@ func vaultWriteWithReauth(
 
 	// If token rejected, force reauth and retry once.
 	if isTokenRejected(err) {
-		auth.Log.Printf("auth: token rejected")
+		auth.Log.Printf("ERROR: auth: token rejected")
 		auth.ForceReauth()
 
 		// attempt #2

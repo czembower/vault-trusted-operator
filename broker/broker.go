@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
 	"net"
 	"net/http"
@@ -11,12 +12,13 @@ import (
 
 // Config controls the local endpoint and behavior.
 type Config struct {
-	// Non-Windows: Unix socket path (e.g., /run/vault-broker.sock)
+	// Local Unix socket / Windows named pipe
 	SocketPath string
 	SocketMode uint32 // e.g., 0660 (only used on non-Windows)
+	PipeName   string
 
-	// Windows: named pipe path (e.g., \\.\pipe\vault-broker)
-	PipeName string
+	// HTTP listener on loopback (alternative to socket/pipe)
+	HTTPAddr string // e.g., "127.0.0.1:8080" (empty = disabled)
 
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
@@ -25,6 +27,7 @@ type Config struct {
 	VaultNamespace  string
 	VaultSkipVerify bool
 	Logger          *log.Logger
+	Debug           bool
 
 	// Access control: allowed peer process UIDs and GIDs
 	AllowedUIDs []uint32
@@ -47,25 +50,46 @@ func DefaultConfig() Config {
 	}
 }
 
-// Run starts the broker server on the OS-appropriate local transport.
-// The Provider implementation is chosen by build tags via DefaultProvider().
+// Run starts the broker server on the OS-appropriate local transport or HTTP loopback.
+// If HTTPAddr is configured, starts HTTP listener on loopback; otherwise uses socket/pipe via Provider.
 func Run(ctx context.Context, cfg Config, t *authmanager.TokenProvider) error {
-	p := DefaultProvider()
+	srv := NewServer(cfg, t)
 
+	if cfg.HTTPAddr != "" {
+		// HTTP loopback mode (localhost only, not for remote access)
+		cfg.Logger.Printf("INFO: broker: starting HTTP listener on %s (loopback only)", cfg.HTTPAddr)
+		return srv.ServeHTTP(ctx, cfg.HTTPAddr)
+	}
+
+	// Socket/pipe mode (default)
+	p := DefaultProvider()
 	ln, err := p.Listen(cfg)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
 
-	srv := NewServer(cfg, t)
-
-	cfg.Logger.Printf("broker: listening on %s", p.DescribeEndpoint(cfg))
+	cfg.Logger.Printf("INFO: broker: listening on %s", p.DescribeEndpoint(cfg))
 	return srv.Serve(ctx, ln)
 }
 
 func NewServer(cfg Config, t *authmanager.TokenProvider) *Server {
 	mux := http.NewServeMux()
+
+	// Create HTTP client for upstream health checks (shared transport, reasonable timeouts)
+	upstreamClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+			TLSClientConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: cfg.VaultSkipVerify,
+			},
+		},
+	}
+
 	s := &Server{
 		Mux: mux,
 		HTTP: &http.Server{
@@ -76,9 +100,11 @@ func NewServer(cfg Config, t *authmanager.TokenProvider) *Server {
 		AllowedUIDs:     cfg.AllowedUIDs,
 		AllowedGIDs:     cfg.AllowedGIDs,
 		start:           time.Now(),
+		upstreamClient:  upstreamClient,
+		upstreamAddr:    cfg.VaultAddress,
 	}
 	s.routes(cfg, t)
 
-	cfg.Logger.Printf("broker: new server started")
+	cfg.Logger.Printf("INFO: broker: new server started")
 	return s
 }

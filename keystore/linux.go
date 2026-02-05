@@ -37,7 +37,7 @@ func resolveDefaultCandidates(a *Auto) (Provider, error) {
 		if kp, err := newTPM2(a); err == nil {
 			return kp, nil
 		} else if a.Log != nil {
-			a.Log.Printf("keystore: tpm2 present but unusable (%v); falling back to file", err)
+			a.Log.Printf("INFO: keystore: tpm2 present but unusable (%v); falling back to file", err)
 		}
 	}
 	return &File{Log: a.Log, Path: a.FileKeyPath}, nil

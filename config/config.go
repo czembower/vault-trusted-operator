@@ -29,10 +29,13 @@ type Config struct {
 	OIDCRole        string
 	OIDCRedirectURI string
 
-	// SecretID behavior
-	WrapTTL        time.Duration
+	// Credential TTLs
+	CredTTL        time.Duration // User-configurable flag, default 5m
+	CredTTLRaw     string        // Raw flag value
+	TokenTTL       time.Duration // 90% of CredTTL, set automatically
+	WrapTTL        time.Duration // For wrapped secret-id
 	WrapTTLRaw     string
-	InMemSecretTTL time.Duration
+	InMemSecretTTL time.Duration // For secret-id
 	RenewFraction  float64
 
 	// State management
@@ -47,6 +50,9 @@ type Config struct {
 	PipeName   string
 	SocketPath string
 	SocketMode uint
+
+	// Broker HTTP listener on loopback (alternative to socket/pipe)
+	HTTPAddr string // Host:port for HTTP listener on localhost (e.g., 127.0.0.1:8080, empty = disabled)
 
 	// Broker access controls
 	AllowedUIDs    []uint32
@@ -69,6 +75,8 @@ func MustLoadConfig() Config {
 
 	flag.StringVar(&cfg.VaultAddrsCSV, "vault-addrs", defaultAddrs, "Comma-separated Vault addresses (overrides VAULT_ADDRS)")
 	flag.StringVar(&cfg.Namespace, "namespace", defaultNamespace, "Vault namespace")
+	defaultCredTTL := "5m"
+	flag.StringVar(&cfg.CredTTLRaw, "cred-ttl", defaultCredTTL, "Credential TTL for both Vault token and secret-id (e.g. 5m, 300s). Token TTL will be set to 90% of this value to avoid race conditions")
 	flag.StringVar(&cfg.WrapTTLRaw, "wrap-ttl", defaultWrapTTL, "Wrapping TTL for secret-id token (e.g. 24h, 3600s) - note that this same TTL will be requested for the AppRole secret ID itself")
 	flag.BoolVar(&cfg.InsecureTLS, "insecure-tls", envBool("VAULT_SKIP_VERIFY", false), "skip TLS verification (NOT recommended)")
 	flag.StringVar(&cfg.AppRoleMount, "approle-mount", envOr("APPROLE_MOUNT", "auth/approle"), "AppRole auth mount path")
@@ -84,6 +92,7 @@ func MustLoadConfig() Config {
 	flag.StringVar(&cfg.SocketPath, "socket-path", "./socket.sock", "Unix socket path (non-Windows) for broker/proxy service")
 	flag.UintVar(&cfg.SocketMode, "socket-mode", 0600, "Unix socket file mode for broker/proxy service")
 	flag.StringVar(&cfg.PipeName, "pipe-path", "./pipe", "Windows named pipe name for broker/proxy service")
+	flag.StringVar(&cfg.HTTPAddr, "http-addr", envOr("BROKER_HTTP_ADDR", "127.0.0.1:8080"), "HTTP listener address on loopback (e.g., 127.0.0.1:8080); empty = disabled, use socket/pipe instead")
 	flag.BoolVar(&cfg.Debug, "debug", envBool("DEBUG", false), "Print verbose debugging logs")
 	flag.StringVar(&cfg.AllowedUIDsCSV, "allowed-uids", envOr("BROKER_ALLOWED_UIDS", ""), "Comma-separated list of allowed user IDs for broker access (e.g., 1000,1001)")
 	flag.StringVar(&cfg.AllowedGIDsCSV, "allowed-gids", envOr("BROKER_ALLOWED_GIDS", ""), "Comma-separated list of allowed group IDs for broker access (e.g., 100,101)")
@@ -101,12 +110,18 @@ func MustLoadConfig() Config {
 		cfg.AllowedGIDs = parseUintList(cfg.AllowedGIDsCSV)
 	}
 
+	credTTL, err := parseFlexibleDuration(cfg.CredTTLRaw)
+	if err != nil {
+		panic("invalid -cred-ttl: " + err.Error())
+	}
+	cfg.CredTTL = credTTL
+	cfg.TokenTTL = time.Duration(float64(credTTL) * 0.9)
+	cfg.InMemSecretTTL = credTTL
 	wrapTTL, err := parseFlexibleDuration(cfg.WrapTTLRaw)
 	if err != nil {
 		panic("invalid -wrap-ttl / WRAP_TTL: " + err.Error())
 	}
 	cfg.WrapTTL = wrapTTL
-	cfg.InMemSecretTTL = envDuration("INMEM_SECRETID_TTL", 60*time.Second)
 	cfg.RenewFraction = envFloat("RENEW_FRACTION", 2.0/3.0)
 
 	cfg.VaultAddrs = splitCSV(cfg.VaultAddrsCSV)
