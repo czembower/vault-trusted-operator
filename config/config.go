@@ -87,6 +87,7 @@ func MustLoadConfig() Config {
 	flag.BoolVar(&cfg.Debug, "debug", envBool("DEBUG", false), "Print verbose debugging logs")
 	flag.StringVar(&cfg.AllowedUIDsCSV, "allowed-uids", envOr("BROKER_ALLOWED_UIDS", ""), "Comma-separated list of allowed user IDs for broker access (e.g., 1000,1001)")
 	flag.StringVar(&cfg.AllowedGIDsCSV, "allowed-gids", envOr("BROKER_ALLOWED_GIDS", ""), "Comma-separated list of allowed group IDs for broker access (e.g., 100,101)")
+	flag.Parse()
 
 	cfg.StateFile = mustAbs(cfg.StateFile)
 	cfg.ProbeTimeout = envDuration("VAULT_PROBE_TIMEOUT", 2*time.Second)
