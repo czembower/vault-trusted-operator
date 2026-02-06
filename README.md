@@ -1,22 +1,23 @@
 # Vault Trusted Operator
 
-A lightweight service that brokers HashiCorp Vault authentication for local host processes, injecting valid Vault tokens via a Unix socket (or Windows named pipe) without exposing credentials to those processes.
+A lightweight service that brokers HashiCorp Vault authentication for local host applications, injecting valid Vault tokens via a Unix socket, Windows named pipe, or HTTP reverse proxy, without exposing credentials to those processes.
 
 ## Overview
 
-**Problem:** Host applications need Vault tokens, but managing credentials (Role IDs, Secret IDs) securely across multiple processes is complex.
+**Problem:** Managing Vault credentials securely is complex for applications that do not have a durable platform-issued source of machine identity.
 
 **Solution:** `vault-trusted-operator` runs as a privileged service that:
 - Bootstraps via manual operator authentication (OIDC only) to set a host-scoped AppRole credential
 - Authenticates as the configured AppRole entity, resulting in a Vault token for the host
-- Manages Vault token lifecycle automatically (renewal, proactive refresh)
-- Maintains a short-lived (1 minute) AppRole Secret ID in memory, treated as single-use in all cases
-- Transparently injects Vault tokens into requests bound for Vault via a reverse proxy (`/v1/` endpoints)
+- Manages Vault token lifecycle automatically (renewal and proactive refresh)
+- Maintains a short-lived AppRole Secret ID in memory, treated as single-use in all cases
+- Transparently injects Vault tokens into requests bound for Vault via a reverse proxy (`/v1/` endpoints) exposed through HTTP loopback, socket, or pipe
 - Requests a wrapped AppRole Secret ID at shutdown, storing this credential on the host for subsequent use
-- Encrypts a "state file" that stores both the persisted credential and the host-specific configuration
+- Encrypts a "state file" that stores both the persisted credential and the host-specific configuration, leveraging TPM2/DPAPI when possible
+- Makes a basic attempt to establish hardware binding by using host-derived metadata (machine UUID, hostname) as Additional Authenticating Data (AAD) for state encryption
 - Transparently retries upstream Vault requests
 
-This pattern allows applications running on systems without inherent machine identity to establish a durable and well-protected credential.
+This pattern allows applications running on systems without inherent machine identity to establish a relatively durable and well-protected credential.
 
 ## Key Features
 
@@ -24,6 +25,7 @@ This pattern allows applications running on systems without inherent machine ide
 - **Automatic Renewal**: Watches token TTL and renews before expiration
 - **Proactive Refresh for Batch Tokens**: Non-renewable tokens are refreshed at 2/3 TTL by requesting new authentication
 - **Single-Use Secret ID Coordination**: Keeps fresh in-memory Secret IDs available for re-authentication if token renewal fails
+- **Wrapped Secret ID for host/application downtime**: A wrapped secret ID is encrypted and stored on the host at shutdown
 
 ### Secure Credential Storage
 - **Sealed State**: Credentials and configuration are encrypted at rest using OS keystore (TPM for Linux, DPAPI for Windows, or file-based fallback)

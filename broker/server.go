@@ -184,13 +184,19 @@ func (s *Server) checkUpstreamHealth(ctx context.Context) (bool, string) {
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return true, "healthy"
-	case http.StatusTooManyRequests:
-		return true, "rate limited"
+		return true, "healthy primary"
+	case 429:
+		return true, "standby server"
+	case 472:
+		return false, "dr secondary"
 	case 473:
-		return true, "replication secondary"
-	case http.StatusNotImplemented:
-		return false, "vault sealed or uninitialized"
+		return true, "performance replication secondary"
+	case 474:
+		return false, "primary node not found"
+	case 501:
+		return false, "vault uninitialized"
+	case 503:
+		return false, "vault sealed"
 	default:
 		return false, fmt.Sprintf("unexpected status: %d", resp.StatusCode)
 	}

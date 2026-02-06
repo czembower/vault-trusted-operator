@@ -78,6 +78,14 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 			if a.Cfg.Debug {
 				a.Log.Printf("DEBUG: auth: using wrapped secret-id token from state")
 			}
+
+			// Validate the wrapped token before using it
+			// We pass 0 for expectedTTL to skip TTL validation (token may have been created with different TTL)
+			if _, err := a.ValidateWrappedToken(ctx, wrapTok, 0); err != nil {
+				a.Log.Printf("WARN: auth: wrapped token validation failed: %v (proceeding anyway)", err)
+				// Continue anyway - the token might still be valid for unwrapping
+			}
+
 			// IMPORTANT: WithWrappingToken expects the SecretID to be the WRAPPING TOKEN
 			return a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
 		}

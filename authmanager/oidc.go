@@ -93,7 +93,113 @@ func (o *OIDCBootstrapper) Bootstrap(ctx context.Context, vaultAddr string) (rol
 			return
 		}
 
-		io.WriteString(w, "Login successful. You can close this window and return to the CLI.\n")
+		html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login Successful</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      padding: 60px 40px;
+      text-align: center;
+      max-width: 500px;
+      animation: slideIn 0.5s ease-out;
+    }
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .checkmark {
+      width: 80px;
+      height: 80px;
+      margin: 0 auto 30px;
+      background: #4CAF50;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: scaleIn 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55) 0.2s backwards;
+    }
+    @keyframes scaleIn {
+      from {
+        transform: scale(0);
+      }
+      to {
+        transform: scale(1);
+      }
+    }
+    .checkmark svg {
+      width: 50px;
+      height: 50px;
+      stroke: white;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    h1 {
+      color: #333;
+      font-size: 28px;
+      margin-bottom: 15px;
+      font-weight: 600;
+    }
+    p {
+      color: #666;
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 30px;
+    }
+    .info {
+      background: #f5f5f5;
+      border-left: 4px solid #667eea;
+      padding: 15px;
+      text-align: left;
+      border-radius: 4px;
+      font-size: 14px;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="checkmark">
+      <svg viewBox="0 0 24 24">
+        <polyline points="20 6 9 17 4 12"></polyline>
+      </svg>
+    </div>
+    <h1>Login Successful</h1>
+    <p>Your identity has been verified and authenticated.</p>
+    <div class="info">
+      <strong>Next step:</strong> You can safely close this window and return to your CLI to continue.
+    </div>
+  </div>
+</body>
+</html>`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, html)
 		codeCh <- gotCode
 	})
 

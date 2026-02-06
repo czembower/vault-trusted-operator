@@ -137,12 +137,21 @@ func main() {
 	auth.SIDRefr = secretIDRefresher
 
 	// Acquire and store a fresh wrapped secret ID immediately after successful initialization.
-	// This serves as a fallback during outages - if in-memory refresh fails and proactive reauth
-	// needs a secret ID, we have a more recent one than the bootstrap token (which was invalidated).
+	// If the role's secret_id_ttl is lower than the requested TTL, we'll fall back to the role default.
+	//
+	// Wrapped Secret ID Lifecycle:
+	// 1. On startup: Load wrapped token from state (if available)
+	// 2. Use wrapped token to authenticate (unwraps it as part of AppRole login) - validates it
+	// 3. Immediately after successful login: Get fresh wrapped secret ID
+	// 4. Persist new token to state (fallback if app crashes before shutdown)
+	// 5. Background goroutine: Refresh token periodically at 50% of TTL (safety net)
+	// 6. On graceful shutdown: Invalidate current token, get fresh one, persist for next startup
+	// 7. All new tokens are validated using sys/wrapping/lookup
+	// Note: Wrapped token requests may fall back to role default if requested TTL exceeds secret_id_ttl
 	if err := secretIDRefresher.RefreshWrappedSecretID(ctx, &t); err != nil {
 		logger.Printf("WARN: failed to acquire initial wrapped secret ID: %v (will retry at shutdown)", err)
 	} else if cfg.Debug {
-		logger.Printf("DEBUG: acquired post-init wrapped secret ID")
+		logger.Printf("DEBUG: acquired fresh wrapped secret ID for recovery")
 	}
 
 	// Persist the post-initialization wrapped secret ID to state immediately.
@@ -157,6 +166,42 @@ func main() {
 	}
 
 	go secretIDRefresher.Run(ctx, &t)
+
+	// Also refresh the wrapped secret-id token periodically (before it expires)
+	// This ensures we always have a fresh token available at next startup
+	go func() {
+		secretIDRefresher.RunWrappedSecretIDRefresher(ctx, &t)
+	}()
+
+	// Periodically persist wrapped token updates to state
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		var lastPersistedToken string
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Check if wrapped token has been updated
+				currentToken := creds.WrappedSecretIDToken()
+				if currentToken != "" && currentToken != lastPersistedToken {
+					// Token has changed - persist to state
+					st.Config = cfg
+					st.RoleID = creds.RoleID()
+					st.WrappedSecretIDToken = currentToken
+					st.SelectedVaultAddr = primary
+					if err := SaveSealedState(cfg.StateFile, key, &st, aad); err != nil {
+						logger.Printf("WARN: failed to persist wrapped secret-id token refresh: %v", err)
+					} else {
+						logger.Printf("INFO: persisted refreshed wrapped secret-id token to state")
+						lastPersistedToken = currentToken
+					}
+				}
+			}
+		}
+	}()
 
 	brokerCfg := broker.DefaultConfig()
 	brokerCfg.PipeName = cfg.PipeName
@@ -183,27 +228,32 @@ func main() {
 
 	<-ctx.Done()
 
-	// On shutdown: write a wrapped secret-id token to state (so a service can restart non-interactively).
+	// Graceful shutdown: Prepare a fresh wrapped token for next startup
 	logger.Println("INFO: maint: shutting down...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	// Invalidate the post-initialization wrapped token (if still present) to prevent credential reuse.
-	// This unwraps the token and consumes the secret ID, ensuring the wrapped token cannot be used again.
+	// 1. Invalidate the current wrapped token to prevent credential reuse.
+	//    This unwraps the token and consumes the secret ID, ensuring single-use guarantees.
 	if postInitToken := creds.WrappedSecretIDToken(); postInitToken != "" {
 		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, postInitToken, &t)
 	}
 
-	// Get a fresh wrapped token at exit (stored in CredStore)
+	// 2. Get a fresh wrapped token for next startup (validated and stored in CredStore)
 	if err := secretIDRefresher.RefreshWrappedSecretID(shutdownCtx, &t); err != nil {
-		logger.Fatalf("config: failed to refresh wrapped secret-id token: %v", err)
+		logger.Fatalf("config: failed to obtain fresh wrapped secret-id for shutdown: %v", err)
 	} else {
-		logger.Printf("INFO: config: stored wrapped secret-id token with TTL %s", cfg.WrapTTL)
+		logger.Printf("INFO: config: obtained fresh wrapped secret-id token (wrapping TTL: %s)", cfg.WrapTTL)
+
+		// Only warn if we actually had to fall back to role defaults
+		if secretIDRefresher.DidLastRefreshFallBackToDefault() {
+			logger.Printf("WARN: config: contained secret ID is using role's default TTL, not the requested TTL - verify role configuration allows desired TTL")
+		}
 	}
 
-	// Persist everything into the state
-	logger.Printf("INFO: config: saving sealed state data")
+	// 3. Persist the fresh wrapped token to state for next startup
+	logger.Printf("INFO: config: persisting fresh wrapped token to state")
 	st.Config = cfg
 	st.RoleID = creds.RoleID()
 	st.WrappedSecretIDToken = creds.WrappedSecretIDToken()

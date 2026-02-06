@@ -76,8 +76,8 @@ func MustLoadConfig() Config {
 	flag.StringVar(&cfg.VaultAddrsCSV, "vault-addrs", defaultAddrs, "Comma-separated Vault addresses (overrides VAULT_ADDRS)")
 	flag.StringVar(&cfg.Namespace, "namespace", defaultNamespace, "Vault namespace")
 	defaultCredTTL := "5m"
-	flag.StringVar(&cfg.CredTTLRaw, "cred-ttl", defaultCredTTL, "Credential TTL for both Vault token and secret-id (e.g. 5m, 300s). Token TTL will be set to 90% of this value to avoid race conditions")
-	flag.StringVar(&cfg.WrapTTLRaw, "wrap-ttl", defaultWrapTTL, "Wrapping TTL for secret-id token (e.g. 24h, 3600s) - note that this same TTL will be requested for the AppRole secret ID itself")
+	flag.StringVar(&cfg.CredTTLRaw, "ephemeral-cred-ttl", defaultCredTTL, "Credential TTL for both Vault token and in-memory secret-id (e.g. 5m, 300s). Token TTL will be set to 90% of this value to avoid race conditions")
+	flag.StringVar(&cfg.WrapTTLRaw, "wrap-ttl", defaultWrapTTL, "Wrapping TTL for state-persisted secret-id token (e.g. 24h, 3600s) - note that this same TTL will be requested for the AppRole secret ID itself")
 	flag.BoolVar(&cfg.InsecureTLS, "insecure-tls", envBool("VAULT_SKIP_VERIFY", false), "skip TLS verification (NOT recommended)")
 	flag.StringVar(&cfg.AppRoleMount, "approle-mount", envOr("APPROLE_MOUNT", "auth/approle"), "AppRole auth mount path")
 	flag.StringVar(&cfg.AppRoleRole, "approle-role", envOr("APPROLE_ROLE", "my-approle"), "AppRole role name")
