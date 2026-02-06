@@ -81,6 +81,28 @@ This pattern allows applications running on systems without inherent machine ide
   └──────────────────────┘
 ```
 
+### Vault Dependencies
+
+- A healthy and reachable Vault server, preferably with TLS configured on the API listener
+- AppRole role configured for a host-based application
+- OIDC auth method configured, with appropriate role and policy for a privileged operator to bootstrap application-specific AppRole auth, e.g.
+```bash
+# Allow reading the AppRole role_id
+path "auth/approle/role/my-approle/role-id" {
+  capabilities = ["read"]
+}
+
+# Allow generating a secret_id
+path "auth/approle/role/my-approle/secret-id" {
+  capabilities = ["update"]
+}
+
+# Allow revoking the bootstrap token
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+```
+
 ## Configuration
 Command-line flags (or environment variables) are used for bootstrap. After the first run, only the path to the encrypted state file needs to be supplied as an argument.
 Configuration can be adjusted via a privileged operator using the `-reconfigure` flag.
