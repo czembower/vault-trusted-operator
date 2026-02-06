@@ -93,7 +93,7 @@ path "auth/token/revoke-self" {
 }
 
 # Allow the AppRole to generate fresh secret IDs for itself
-path "auth/approle/role/trusted-operator/secret-id" {
+path "auth/approle/role/host-approle/secret-id" {
   capabilities = ["update"]
 }
 
@@ -102,12 +102,12 @@ path "auth/approle/role/trusted-operator/secret-id" {
 - OIDC auth method configured, with appropriate role and policy for a privileged operator to bootstrap application-specific AppRole auth, e.g.
 ```bash
 # Allow reading the AppRole role_id
-path "auth/approle/role/my-approle/role-id" {
+path "auth/approle/role/host-approle/role-id" {
   capabilities = ["read"]
 }
 
 # Allow generating a secret ID on behalf of host application
-path "auth/approle/role/my-approle/secret-id" {
+path "auth/approle/role/host-approle/secret-id" {
   capabilities = ["update"]
 }
 
