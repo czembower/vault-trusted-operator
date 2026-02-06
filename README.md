@@ -84,7 +84,23 @@ This pattern allows applications running on systems without inherent machine ide
 ### Vault Dependencies
 
 - A healthy and reachable Vault server, preferably with TLS configured on the API listener
-- AppRole role configured for a host-based application
+- AppRole role configured for a host-based application (ACL policy must grant ability to create AppRole secret IDs), e.g.
+```bash
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+
+# Allow the AppRole to generate fresh secret IDs for itself
+path "auth/approle/role/trusted-operator/secret-id" {
+  capabilities = ["update"]
+}
+
+[ ... additional application-specific access policies ]
+```
 - OIDC auth method configured, with appropriate role and policy for a privileged operator to bootstrap application-specific AppRole auth, e.g.
 ```bash
 # Allow reading the AppRole role_id
@@ -92,7 +108,7 @@ path "auth/approle/role/my-approle/role-id" {
   capabilities = ["read"]
 }
 
-# Allow generating a secret_id
+# Allow generating a secret ID on behalf of host application
 path "auth/approle/role/my-approle/secret-id" {
   capabilities = ["update"]
 }
