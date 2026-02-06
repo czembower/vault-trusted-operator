@@ -46,7 +46,7 @@ func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Clie
 		return nil, err
 	}
 
-	secret, err := a.login(ctx, client)
+	secret, fallbackUsed, err := a.loginWithFallback(ctx, client)
 	if err != nil {
 		return nil, err
 	}
@@ -56,27 +56,81 @@ func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Clie
 
 	a.client = client
 	a.watcherErr = nil
+
+	// If we successfully authenticated using fallback (wrapped secret ID), trigger immediate credential refresh.
+	// This ensures we obtain a fresh in-memory secret ID and replace the now-invalidated wrapped secret ID.
+	if fallbackUsed && a.SIDRefr != nil {
+		// Unlock to allow the refresher to call back into AuthManager if needed.
+		a.mu.Unlock()
+		a.refreshCredentialsOnFallback(ctx, t)
+		a.mu.Lock()
+	}
+
 	return a.client, nil
 }
 
+// refreshCredentialsOnFallback asynchronously refreshes in-memory and wrapped secret IDs
+// after a successful fallback authentication. This ensures we don't get a stale in-memory credential
+// and that the invalidated wrapped token is replaced with a fresh one.
+func (a *AuthManager) refreshCredentialsOnFallback(ctx context.Context, t *TokenProvider) {
+	// Use a short timeout for credential refresh; don't block indefinitely
+	refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Refresh in-memory secret ID
+	if _, err := a.SIDRefr.RefreshOnce(refreshCtx, a.Cfg.CredTTL, nil, t); err != nil {
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: failed to refresh in-memory secret ID after fallback: %v (proceeding with fallback credential)", err)
+		}
+		// Continue even on error; the fallback credential is still valid
+	} else if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: auth: refreshed in-memory secret ID after fallback")
+	}
+
+	// Refresh wrapped secret ID (after in-memory succeeds or attempts)
+	if err := a.SIDRefr.RefreshWrappedSecretID(refreshCtx, t); err != nil {
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: failed to refresh wrapped secret ID after fallback: %v", err)
+		}
+		// Continue even on error; the fallback is still valid
+	} else if a.Cfg.Debug {
+		a.Log.Printf("DEBUG: auth: refreshed wrapped secret ID after fallback")
+	}
+}
+
 func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.Secret, error) {
+	secret, _, err := a.loginWithFallback(ctx, client)
+	return secret, err
+}
+
+// loginWithFallback attempts to authenticate with AppRole credentials, attempting in-memory secret ID first,
+// and falling back to wrapped secret ID if the in-memory credential fails.
+// Returns (*vault.Secret, fallbackUsed, error).
+// If fallbackUsed is true, the caller should trigger a credential refresh to obtain a new in-memory secret ID
+// and replace the now-invalidated wrapped secret ID.
+func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Client) (*vault.Secret, bool, error) {
 	roleID := a.Creds.RoleID()
 
-	// 1) Prefer: in-memory secret-id
+	// 1) Prefer: in-memory secret-id (try first)
 	if roleID != "" {
 		if sid := a.Creds.InMemSecretID(); sid != "" {
 			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: using in-memory secret-id")
+				a.Log.Printf("DEBUG: auth: attempting login with in-memory secret-id")
 			}
-			return a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: sid}, false)
+			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: sid}, false)
+			if err == nil {
+				return secret, false, nil
+			}
+			// In-memory secret ID failed; log and attempt fallback
+			a.Log.Printf("WARN: auth: in-memory secret-id authentication failed: %v (attempting fallback to wrapped secret-id)", err)
 		}
 	}
 
-	// 2) Next: wrapped secret-id token from *state*
+	// 2) Fallback: wrapped secret-id token from *state*
 	if roleID != "" {
 		if wrapTok := a.Creds.WrappedSecretIDToken(); wrapTok != "" {
 			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: using wrapped secret-id token from state")
+				a.Log.Printf("DEBUG: auth: attempting fallback with wrapped secret-id token from state")
 			}
 
 			// Validate the wrapped token before using it
@@ -87,24 +141,31 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 			}
 
 			// IMPORTANT: WithWrappingToken expects the SecretID to be the WRAPPING TOKEN
-			return a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
+			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
+			if err == nil {
+				a.Log.Printf("INFO: auth: successfully authenticated with fallback wrapped secret-id; will refresh credentials")
+				return secret, true, nil
+			}
+			// Wrapped fallback also failed; continue to bootstrap
+			a.Log.Printf("WARN: auth: wrapped secret-id authentication failed: %v (proceeding to bootstrap)", err)
 		}
 	}
 
 	// 3) Fallback: interactive OIDC bootstrap
 	if a.Cfg.OIDCRole == "" {
-		return nil, errors.New("no secret-id available and oidc-role is not set (cannot bootstrap)")
+		return nil, false, errors.New("no secret-id available and oidc-role is not set (cannot bootstrap)")
 	}
 
 	a.Log.Printf("INFO: auth: bootstrapping via OIDC (interactive)")
 	rid, sid, err := a.OIDC.Bootstrap(ctx, client.Address())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	a.Creds.SetRoleID(rid)
 	a.Creds.SetInMemSecretID(sid)
 
-	return a.loginWithAppRole(ctx, client, rid, approle.SecretID{FromString: sid}, false)
+	secret, err := a.loginWithAppRole(ctx, client, rid, approle.SecretID{FromString: sid}, false)
+	return secret, false, err
 }
 
 func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client, roleID string, sid approle.SecretID, wrapped bool) (*vault.Secret, error) {
