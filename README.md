@@ -56,9 +56,7 @@ This pattern allows applications running on systems without inherent machine ide
 │ ┌───────────────────────────────┤
 │ │ HTTP Broker                   │
 │ │ ├─ /health                    │
-│ │ ├─ /token (Vault token status)│
 │ │ ├─ /v1/* (reverse proxy)      │
-│ │ └─ /v1/echo (debug)           │
 │ │                               │
 │ │ AuthManager                   │
 │ │ ├─ Token lifecycle            │
