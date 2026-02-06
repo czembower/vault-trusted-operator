@@ -249,21 +249,28 @@ func main() {
 	cancel()
 	wg.Wait()
 
-	// Graceful shutdown: Prepare a fresh wrapped token for next startup
+	// Graceful shutdown: Attempt to obtain a fresh wrapped token for next startup
 	logger.Println("INFO: maint: shutting down...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	// Save the current wrapped token before invalidation in case refresh fails.
+	// If we can't get a new one, we'll keep the existing one in state.
+	preservedToken := creds.WrappedSecretIDToken()
+
 	// 1. Invalidate the current wrapped token to prevent credential reuse.
 	//    This unwraps the token and consumes the secret ID, ensuring single-use guarantees.
-	if postInitToken := creds.WrappedSecretIDToken(); postInitToken != "" {
-		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, postInitToken, &t)
+	if preservedToken != "" {
+		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, preservedToken, &t)
 	}
 
 	// 2. Get a fresh wrapped token for next startup (validated and stored in CredStore)
+	//    Only persist to state if this succeeds. If it fails, we keep the pre-invalidation token.
+	var refreshSucceeded bool
 	if err := secretIDRefresher.RefreshWrappedSecretID(shutdownCtx, &t); err != nil {
-		logger.Printf("ERROR: config: failed to obtain fresh wrapped secret-id for shutdown: %v (persisting current state)", err)
+		logger.Printf("WARN: config: failed to obtain fresh wrapped secret-id for shutdown: %v (keeping existing token in state)", err)
+		refreshSucceeded = false
 	} else {
 		logger.Printf("INFO: config: obtained fresh wrapped secret-id token (wrapping TTL: %s)", cfg.WrapTTL)
 
@@ -271,14 +278,26 @@ func main() {
 		if secretIDRefresher.DidLastRefreshFallBackToDefault() {
 			logger.Printf("WARN: config: contained secret ID is using role's default TTL, not the requested TTL - verify role configuration allows desired TTL")
 		}
+		refreshSucceeded = true
 	}
 
-	// 3. Persist the fresh wrapped token to state for next startup
-	logger.Printf("INFO: config: persisting fresh wrapped token to state")
+	// 3. Persist state for next startup
+	//    - If refresh succeeded: persist the new fresh token from CredStore
+	//    - If refresh failed: keep the pre-invalidation token (no state modification)
+	logger.Printf("INFO: config: persisting state for next startup")
 	st.Config = cfg
 	st.RoleID = creds.RoleID()
-	st.WrappedSecretIDToken = creds.WrappedSecretIDToken()
 	st.SelectedVaultAddr = primary
+
+	if refreshSucceeded {
+		// New token was successfully procured and validated
+		st.WrappedSecretIDToken = creds.WrappedSecretIDToken()
+		logger.Printf("INFO: config: persisted fresh wrapped secret-id token to state")
+	} else {
+		// Refresh failed; preserve the pre-invalidation token that was already in state
+		st.WrappedSecretIDToken = preservedToken
+		logger.Printf("INFO: config: refresh failed; preserved existing wrapped secret-id token in state for recovery")
+	}
 
 	if err := SaveSealedState(cfg.StateFile, key, &st, aad); err != nil {
 		logger.Fatalf("failed to save sealed state: %v", err)

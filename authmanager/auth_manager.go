@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,21 +17,20 @@ import (
 )
 
 type AuthManager struct {
-	Cfg     config.Config
-	Log     *log.Logger
-	Clients *VaultClientFactory
-	Creds   *CredStore
-	OIDC    *OIDCBootstrapper
-	SIDRefr *SecretIDRefresher // Optional: used for proactive reauth to get fresh secret IDs
-
-	mu     sync.Mutex
-	client *vault.Client
-
-	// watcher lifecycle
+	Cfg           config.Config
+	Log           *log.Logger
+	Clients       *VaultClientFactory
+	Creds         *CredStore
+	OIDC          *OIDCBootstrapper
+	SIDRefr       *SecretIDRefresher
+	mu            sync.Mutex
+	client        *vault.Client
 	watcherCancel context.CancelFunc
 	watcherErr    error
 }
 
+// Initializes or returns an authenticated Vault client
+// Implements retry-with-backoff for transient errors and fallback for credential rejections.
 func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Client, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -46,27 +47,72 @@ func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Clie
 		return nil, err
 	}
 
-	secret, fallbackUsed, err := a.loginWithFallback(ctx, client)
-	if err != nil {
+	// Attempt authentication with retry-with-backoff for transient errors.
+	// Only try fallback when we detect a credential rejection (not just connectivity issues).
+	const maxRetries = 3
+	var lastErr error
+	var backoffDuration time.Duration
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Apply exponential backoff on retries (skip for first attempt)
+		if attempt > 0 {
+			backoffDuration = time.Duration(1<<uint(attempt-1)) * time.Second
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: retry attempt %d after %v (transient error: %v)", attempt, backoffDuration, lastErr)
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoffDuration):
+				// Retry
+			}
+		}
+
+		secret, fallbackUsed, err := a.loginWithFallback(ctx, client)
+		if err == nil {
+			// Success - start watcher and return
+			a.startWatcher(client, secret, t)
+			a.client = client
+			a.watcherErr = nil
+
+			// If we successfully authenticated using fallback, trigger immediate credential refresh.
+			if fallbackUsed && a.SIDRefr != nil {
+				a.mu.Unlock()
+				a.refreshCredentialsOnFallback(ctx, t)
+				a.mu.Lock()
+			}
+
+			return a.client, nil
+		}
+
+		lastErr = err
+
+		// If this is a credential rejection error, don't retry - fall back or fail immediately
+		if isCredentialRejected(err) {
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: credential rejected (not retrying): %v", err)
+			}
+			return nil, err
+		}
+
+		// If this is a transient error, retry if we haven't exhausted retries
+		if isTransientError(err) {
+			if attempt < maxRetries {
+				if a.Cfg.Debug {
+					a.Log.Printf("DEBUG: auth: transient error, will retry: %v", err)
+				}
+				continue
+			}
+			// Fall through to return error after max retries
+		}
+
+		// For other errors, return immediately (e.g., configuration errors)
 		return nil, err
 	}
 
-	// Start a lifetime watcher for renewals; if it fails, we mark watcherErr and force re-auth next call.
-	a.startWatcher(client, secret, t)
-
-	a.client = client
-	a.watcherErr = nil
-
-	// If we successfully authenticated using fallback (wrapped secret ID), trigger immediate credential refresh.
-	// This ensures we obtain a fresh in-memory secret ID and replace the now-invalidated wrapped secret ID.
-	if fallbackUsed && a.SIDRefr != nil {
-		// Unlock to allow the refresher to call back into AuthManager if needed.
-		a.mu.Unlock()
-		a.refreshCredentialsOnFallback(ctx, t)
-		a.mu.Lock()
-	}
-
-	return a.client, nil
+	// Exhausted retries on transient error
+	return nil, fmt.Errorf("authentication failed after %d retries: %w", maxRetries, lastErr)
 }
 
 // refreshCredentialsOnFallback asynchronously refreshes in-memory and wrapped secret IDs
@@ -449,4 +495,96 @@ func TokenPrefix(token string) string {
 		return token[:20] + "..."
 	}
 	return token
+}
+
+// isCredentialRejected determines if an error is due to credential rejection
+// (e.g., invalid secret ID, permission denied) versus transient connectivity issues.
+// Returns true if Vault explicitly rejected the credential.
+func isCredentialRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for explicit credential rejection errors from Vault
+	var re *vault.ResponseError
+	if errors.As(err, &re) {
+		// 401 = Unauthorized (bad credentials)
+		// 403 = Forbidden (could be bad token or policy denial)
+		if re.StatusCode == 401 || re.StatusCode == 403 {
+			msg := strings.ToLower(strings.Join(re.Errors, " "))
+			// These messages indicate credential issues, not transient problems
+			if strings.Contains(msg, "invalid secret id") ||
+				strings.Contains(msg, "secret id invalid") ||
+				strings.Contains(msg, "bad secret id") ||
+				strings.Contains(msg, "permission denied") ||
+				strings.Contains(msg, "role_id is invalid") ||
+				strings.Contains(msg, "role id is invalid") {
+				return true
+			}
+		}
+	}
+
+	// Check error message string for known credential rejection patterns
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "invalid secret id") ||
+		strings.Contains(errMsg, "secret id invalid") ||
+		strings.Contains(errMsg, "bad secret id") {
+		return true
+	}
+
+	return false
+}
+
+// isTransientError determines if an error is transient and should be retried.
+// Returns true for network errors, timeouts, and other issues where retrying may succeed.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for context cancellation/deadline (not transient - higher level should handle)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Check for network-level errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		// Timeouts, connection refused, etc. are transient
+		if netErr.Timeout() {
+			return true
+		}
+		// Connection refused, reset, etc. are transient
+		if strings.Contains(netErr.Error(), "connection refused") ||
+			strings.Contains(netErr.Error(), "connection reset") ||
+			strings.Contains(netErr.Error(), "i/o timeout") {
+			return true
+		}
+	}
+
+	// Check for Vault response errors with 5xx (server error)
+	var re *vault.ResponseError
+	if errors.As(err, &re) {
+		// 5xx errors are transient (server is having issues, might recover)
+		if re.StatusCode >= 500 && re.StatusCode < 600 {
+			return true
+		}
+		// 429 = Too Many Requests (transient)
+		if re.StatusCode == 429 {
+			return true
+		}
+	}
+
+	// Check error message for known transient patterns
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "connect") ||
+		strings.Contains(errMsg, "timeout") ||
+		strings.Contains(errMsg, "unavailable") ||
+		strings.Contains(errMsg, "connection") ||
+		strings.Contains(errMsg, "dial") ||
+		strings.Contains(errMsg, "refused") {
+		return true
+	}
+
+	return false
 }
