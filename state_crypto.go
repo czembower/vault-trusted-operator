@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -39,7 +40,7 @@ type StatePayload struct {
 func LoadOrCreateKey(keyPath string) ([]byte, error) {
 	b, err := os.ReadFile(keyPath)
 	if err == nil {
-		key, err := base64.StdEncoding.DecodeString(string(bytesTrimSpace(b)))
+		key, err := base64.StdEncoding.DecodeString(string(bytes.TrimSpace(b)))
 		if err != nil {
 			return nil, fmt.Errorf("decode key: %w", err)
 		}
@@ -174,19 +175,6 @@ func LoadSealedEnvelope(statePath string) (*SealedStateFile, error) {
 		return nil, err
 	}
 	return &env, nil
-}
-
-func bytesTrimSpace(b []byte) []byte {
-	// minimal trim w/out pulling strings everywhere
-	i := 0
-	j := len(b)
-	for i < j && (b[i] == ' ' || b[i] == '\n' || b[i] == '\r' || b[i] == '\t') {
-		i++
-	}
-	for j > i && (b[j-1] == ' ' || b[j-1] == '\n' || b[j-1] == '\r' || b[j-1] == '\t') {
-		j--
-	}
-	return b[i:j]
 }
 
 // ZeroBytes securely overwrites a byte slice with zeros to minimize key exposure time in memory.

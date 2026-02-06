@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -73,15 +72,4 @@ func NewVaultReverseProxy(cfg Config, t *authmanager.TokenProvider) (*httputil.R
 	}
 
 	return rp, nil
-}
-
-// Optional wrapper to add request-level policy / auth / logging.
-func ProxyHandler(ctx context.Context, rp *httputil.ReverseProxy) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Basic hardening examples:
-		// - Require a client auth mechanism before proxying
-		// - Block dangerous endpoints if clients are untrusted
-		// - Enforce methods
-		rp.ServeHTTP(w, r)
-	})
 }

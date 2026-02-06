@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 	"vault-trusted-operator/config"
 
@@ -19,8 +20,9 @@ type SecretIDRefresher struct {
 	Log  *log.Logger
 	Auth *AuthManager
 
-	// Track whether the last refresh fell back to role defaults due to TTL rejection
-	lastRefreshFellBackToDefault bool
+	// Track whether the last refresh fell back to role defaults due to TTL rejection.
+	// Accessed from background goroutines and main goroutine at shutdown; must be atomic.
+	lastRefreshFellBackToDefault atomic.Bool
 }
 
 // Run keeps an in-memory secret-id fresh by periodically requesting a new one.
@@ -168,7 +170,7 @@ func (s *SecretIDRefresher) RefreshWrappedSecretID(ctx context.Context, t *Token
 // DidLastRefreshFallBackToDefault returns true if the most recent refresh had to fall back
 // to the role's default secret_id_ttl due to the requested TTL being too long.
 func (s *SecretIDRefresher) DidLastRefreshFallBackToDefault() bool {
-	return s.lastRefreshFellBackToDefault
+	return s.lastRefreshFellBackToDefault.Load()
 }
 
 // GetFreshWrappedSecretID obtains a fresh wrapped secret ID token that can be persisted to state.
@@ -221,7 +223,7 @@ func (s *SecretIDRefresher) RefreshOnce(ctx context.Context, rawTTL time.Duratio
 		s.Log.Printf("WARN: auth: requested TTL (%d seconds) exceeds role's secret_id_ttl, retrying without TTL (will use role default)", requestedTTL)
 
 		// Mark that we fell back to role defaults
-		s.lastRefreshFellBackToDefault = true
+		s.lastRefreshFellBackToDefault.Store(true)
 
 		// Retry with empty payload (no TTL specified)
 		payload := map[string]any{}

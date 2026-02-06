@@ -27,7 +27,7 @@ type Server struct {
 type HealthStatus struct {
 	Healthy     bool   `json:"ok"`
 	UptimeSec   int64  `json:"uptime_sec"`
-	Token       string `json:"token"`
+	Token       string `json:"token,omitempty"`
 	UpstreamOk  bool   `json:"upstream_ok"`
 	UpstreamMsg string `json:"upstream_msg,omitempty"`
 }
@@ -44,13 +44,17 @@ func (s *Server) routes(cfg Config, t *authmanager.TokenProvider) {
 		}
 		uptime := int64(time.Since(s.start).Seconds())
 		upstreamOk, upstreamMsg := s.checkUpstreamHealth(r.Context())
-		writeJSON(w, http.StatusOK, HealthStatus{
-			Token:       authmanager.TokenPrefix(t.GetToken()),
+		status := HealthStatus{
 			UptimeSec:   uptime,
 			Healthy:     true,
 			UpstreamOk:  upstreamOk,
 			UpstreamMsg: upstreamMsg,
-		})
+		}
+		// Only expose token prefix in debug mode to avoid leaking partial tokens
+		if cfg.Debug {
+			status.Token = authmanager.TokenPrefix(t.GetToken())
+		}
+		writeJSON(w, http.StatusOK, status)
 	})
 
 	// Wrap proxy with debug logging if enabled

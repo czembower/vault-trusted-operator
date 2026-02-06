@@ -134,9 +134,9 @@ func MustLoadConfig() Config {
 		cfg.KeyStore = "auto"
 	}
 	switch cfg.KeyStore {
-	case "auto", "file", "dpapi":
+	case "auto", "file", "dpapi", "tpm":
 	default:
-		panic(fmt.Sprintf("invalid -keystore=%q (expected auto|file|dpapi)", cfg.KeyStore))
+		panic(fmt.Sprintf("invalid -keystore=%q (expected auto|file|dpapi|tpm)", cfg.KeyStore))
 	}
 
 	// Default key file paths to siblings of the state file if not explicitly provided.
@@ -162,9 +162,6 @@ func MustLoadConfig() Config {
 		473: true, // performance standby (Vault)
 	}
 
-	if len(cfg.VaultAddrs) == 0 {
-		panic("no Vault addresses provided")
-	}
 	if cfg.RenewFraction <= 0 || cfg.RenewFraction >= 1 {
 		panic("renew-fraction must be between 0 and 1")
 	}

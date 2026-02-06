@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"vault-trusted-operator/authmanager"
@@ -62,7 +63,7 @@ func main() {
 			cfg = st.Config
 			logger.Printf("INFO: config: loaded sealed state from %s", cfg.StateFile)
 			if SetFlagNamesCSV() != "" {
-				logger.Printf("INFO: WARN: ignored command line arguments due to present state file: %v", SetFlagNamesCSV())
+				logger.Printf("WARN: ignored command line arguments due to present state file: %v", SetFlagNamesCSV())
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			logger.Fatalf("failed to load sealed state file: %v", err)
@@ -165,16 +166,20 @@ func main() {
 		}
 	}
 
-	go secretIDRefresher.Run(ctx, &t)
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		secretIDRefresher.Run(ctx, &t)
+	})
 
 	// Also refresh the wrapped secret-id token periodically (before it expires)
 	// This ensures we always have a fresh token available at next startup
-	go func() {
+	wg.Go(func() {
 		secretIDRefresher.RunWrappedSecretIDRefresher(ctx, &t)
-	}()
+	})
 
 	// Periodically persist wrapped token updates to state
-	go func() {
+	wg.Go(func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		var lastPersistedToken string
@@ -201,7 +206,7 @@ func main() {
 				}
 			}
 		}
-	}()
+	})
 
 	brokerCfg := broker.DefaultConfig()
 	brokerCfg.PipeName = cfg.PipeName
@@ -220,13 +225,29 @@ func main() {
 		logger.Printf("INFO: broker: access control enabled - UIDs: %v, GIDs: %v", cfg.AllowedUIDs, cfg.AllowedGIDs)
 	}
 
-	if err := broker.Run(ctx, brokerCfg, &t); err != nil && err != context.Canceled {
-		logger.Fatalf("broker stopped: %v", err)
-	}
-
 	logger.Printf("INFO: running; press ctrl+c to exit")
 
-	<-ctx.Done()
+	brokerErrCh := make(chan error, 1)
+	go func() {
+		brokerErrCh <- broker.Run(ctx, brokerCfg, &t)
+	}()
+
+	// Wait for either signal (ctx cancelled) or broker fatal error.
+	select {
+	case <-ctx.Done():
+		// Normal shutdown path (SIGINT/SIGTERM)
+	case err := <-brokerErrCh:
+		if err != nil && err != context.Canceled {
+			logger.Printf("ERROR: broker stopped unexpectedly: %v", err)
+			// Fall through to shutdown logic instead of Fatalf so credentials are persisted
+		}
+	}
+
+	// Cancel context to signal all background goroutines, then wait for them
+	// to finish before proceeding. This prevents the persistence ticker from
+	// racing with shutdown's own SaveSealedState call.
+	cancel()
+	wg.Wait()
 
 	// Graceful shutdown: Prepare a fresh wrapped token for next startup
 	logger.Println("INFO: maint: shutting down...")
@@ -242,7 +263,7 @@ func main() {
 
 	// 2. Get a fresh wrapped token for next startup (validated and stored in CredStore)
 	if err := secretIDRefresher.RefreshWrappedSecretID(shutdownCtx, &t); err != nil {
-		logger.Fatalf("config: failed to obtain fresh wrapped secret-id for shutdown: %v", err)
+		logger.Printf("ERROR: config: failed to obtain fresh wrapped secret-id for shutdown: %v (persisting current state)", err)
 	} else {
 		logger.Printf("INFO: config: obtained fresh wrapped secret-id token (wrapping TTL: %s)", cfg.WrapTTL)
 

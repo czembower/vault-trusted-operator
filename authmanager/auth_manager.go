@@ -196,43 +196,27 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 	go func() {
 		// Watcher blocks until done or error.
 		go w.Start()
-		select {
-		case <-wctx.Done():
-			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: watcher: done")
-			}
-			w.Stop()
-			return
-		case err := <-w.DoneCh():
-			if err != nil {
-				a.mu.Lock()
-				a.watcherErr = fmt.Errorf("token renewal failed: %w", err)
-				a.mu.Unlock()
-			}
-			return
-		case <-w.RenewCh():
-			// RenewCh may emit multiple times; keep listening until DoneCh or cancel.
-			for {
-				select {
-				case <-wctx.Done():
-					if a.Cfg.Debug {
-						a.Log.Printf("DEBUG: watcher: renew phase done")
-					}
-					w.Stop()
-					return
-				case err := <-w.DoneCh():
-					if err != nil {
-						a.mu.Lock()
-						a.watcherErr = fmt.Errorf("token renewal failed: %w", err)
-						a.mu.Unlock()
-					}
-					return
-				case <-w.RenewCh():
-					// Token was renewed by the watcher
-					t.SetTokenWithExpiry(client.Token(), ttl, true)
-					if a.Cfg.Debug {
-						a.Log.Printf("DEBUG: authmanager: renewed token: %s address: %p", TokenPrefix(t.GetToken()), t)
-					}
+		for {
+			select {
+			case <-wctx.Done():
+				if a.Cfg.Debug {
+					a.Log.Printf("DEBUG: watcher: done")
+				}
+				w.Stop()
+				return
+			case err := <-w.DoneCh():
+				if err != nil {
+					a.mu.Lock()
+					a.watcherErr = fmt.Errorf("token renewal failed: %w", err)
+					a.mu.Unlock()
+				}
+				return
+			case renewal := <-w.RenewCh():
+				// Token was renewed — use the actual renewed TTL, not the original login TTL
+				renewedTTL := time.Duration(renewal.Secret.Auth.LeaseDuration) * time.Second
+				t.SetTokenWithExpiry(client.Token(), renewedTTL, true)
+				if a.Cfg.Debug {
+					a.Log.Printf("DEBUG: authmanager: renewed token: %s (TTL: %s) address: %p", TokenPrefix(t.GetToken()), renewedTTL, t)
 				}
 			}
 		}

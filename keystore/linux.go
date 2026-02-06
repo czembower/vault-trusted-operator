@@ -201,13 +201,15 @@ func (p *TPM2) sealToTPM(secret []byte) ([]byte, error) {
 
 	// Template for a sealed keyed-hash object.
 	// KeyedHash + NULL scheme, with UserWithAuth so Unseal is allowed.
+	// SensitiveDataOrigin must be false: the secret is generated externally
+	// (crypto/rand), not by the TPM itself.
 	pub := tpm2.TPMTPublic{
 		Type:    tpm2.TPMAlgKeyedHash,
 		NameAlg: tpm2.TPMAlgSHA256,
 		ObjectAttributes: tpm2.TPMAObject{
 			FixedTPM:            true,
 			FixedParent:         true,
-			SensitiveDataOrigin: true,
+			SensitiveDataOrigin: false,
 			UserWithAuth:        true,
 			NoDA:                true,
 		},

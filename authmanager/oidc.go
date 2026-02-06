@@ -245,6 +245,9 @@ func (o *OIDCBootstrapper) Bootstrap(ctx context.Context, vaultAddr string) (rol
 		return "", "", err
 	}
 
+	// 7) Revoke the OIDC bootstrap token — it has broader permissions than the AppRole token
+	o.revokeToken(ctx, vaultAddr, token)
+
 	return roleID, secretID, nil
 }
 
@@ -337,6 +340,34 @@ func (o *OIDCBootstrapper) getSecretID(ctx context.Context, vaultAddr, token str
 	return r.Data.SecretID, nil
 }
 
+// revokeToken best-effort revokes a Vault token so it cannot be reused.
+// The OIDC bootstrap token typically has broader permissions than the resulting
+// AppRole token, so we revoke it immediately after use to limit exposure.
+func (o *OIDCBootstrapper) revokeToken(ctx context.Context, vaultAddr, token string) {
+	u := fmt.Sprintf("%s/v1/auth/token/revoke-self", vaultAddr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, nil)
+	if err != nil {
+		o.Log.Printf("WARN: oidc: failed to create revoke request: %v", err)
+		return
+	}
+	req.Header.Set("X-Vault-Token", token)
+	if o.Cfg.Namespace != "" {
+		req.Header.Set("X-Vault-Namespace", o.Cfg.Namespace)
+	}
+	resp, err := o.HTTP.Do(req)
+	if err != nil {
+		o.Log.Printf("WARN: oidc: failed to revoke bootstrap token: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		o.Log.Printf("INFO: oidc: revoked bootstrap token")
+	} else {
+		o.Log.Printf("WARN: oidc: token revocation returned status %d", resp.StatusCode)
+	}
+}
+
 func (o *OIDCBootstrapper) doJSON(ctx context.Context, method, u string, payload any, token string) ([]byte, error) {
 	var body io.Reader
 	if payload != nil {
@@ -365,7 +396,7 @@ func (o *OIDCBootstrapper) doJSON(ctx context.Context, method, u string, payload
 	}
 	defer resp.Body.Close()
 
-	out, _ := io.ReadAll(resp.Body)
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB response limit
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("vault http %d: %s", resp.StatusCode, string(out))
 	}
