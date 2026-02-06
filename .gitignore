@@ -34,3 +34,4 @@ go.work.sum
 # App specifics
 state.json
 state.key
+vault-trusted-operator
