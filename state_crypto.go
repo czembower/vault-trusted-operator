@@ -34,6 +34,7 @@ type StatePayload struct {
 	RoleID               string        `json:"role_id,omitempty"`
 	WrappedSecretIDToken string        `json:"wrapped_secret_id_token,omitempty"`
 	SelectedVaultAddr    string        `json:"selected_vault_addr,omitempty"`
+	OIDCIdentityToken    string        `json:"oidc_identity_token,omitempty"` // JWT from identity/oidc/token endpoint
 }
 
 // LoadOrCreateKey reads a base64 key from keyPath, or generates one if missing.

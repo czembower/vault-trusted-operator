@@ -26,6 +26,8 @@ This pattern allows applications running on systems without inherent machine ide
 - **Proactive Refresh for Batch Tokens**: Non-renewable tokens are refreshed at 2/3 TTL by requesting new authentication
 - **Single-Use Secret ID Coordination**: Keeps fresh in-memory Secret IDs available for re-authentication if token renewal fails
 - **Wrapped Secret ID for host/application downtime**: A wrapped secret ID is encrypted and stored on the host at shutdown
+- **Identity Token Support (Optional)**: Automatically requests and refreshes Vault identity tokens (JWTs) from a configured role, with dynamic refresh based on JWT expiration claim (refreshes at 90% TTL)
+- **Plaintext Token File**: Optionally writes identity tokens to a plaintext file with secure permissions (0600) for simplified external application integration
 
 ### Secure Credential Storage
 - **Sealed State**: Credentials and configuration are encrypted at rest using OS keystore (TPM for Linux, DPAPI for Windows, or file-based fallback)
@@ -174,7 +176,7 @@ Configuration can be adjusted via a privileged operator using the `-reconfigure`
     Force initial configuration (env: RECONFIGURE)
 ```
 
-**OIDC (Optional Fallback):**
+**OIDC (Optional Bootstrap):**
 ```bash
 -oidc-mount string
     OIDC auth mount name (default "oidc", env: OIDC_MOUNT)
@@ -182,6 +184,14 @@ Configuration can be adjusted via a privileged operator using the `-reconfigure`
     OIDC role name (default "default_role", env: OIDC_ROLE)
 -oidc-redirect-uri string
     OIDC callback URI (env: OIDC_REDIRECT_URI)
+```
+
+**Identity Token (Optional):**
+```bash
+-identity-token-role string
+    Vault identity token role for issuing JWTs (empty to disable, env: IDENTITY_TOKEN_ROLE)
+-identity-token-file string
+    Path to write plaintext identity token (JWT) for application integration; uses restrictive 0600 permissions (empty to disable, env: IDENTITY_TOKEN_FILE)
 ```
 
 **Other:**

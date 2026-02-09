@@ -25,9 +25,11 @@ type Config struct {
 	AppRoleRole  string
 
 	// OIDC bootstrap (interactive fallback)
-	OIDCMount       string
-	OIDCRole        string
-	OIDCRedirectURI string
+	OIDCMount         string
+	OIDCRole          string
+	OIDCRedirectURI   string
+	IdentityTokenRole string // Role to request identity token for (TTL inferred from JWT exp claim)
+	IdentityTokenFile string // File path to write plaintext identity token (leave empty to disable)
 
 	// Credential TTLs
 	CredTTL        time.Duration // User-configurable flag, default 5m
@@ -84,6 +86,8 @@ func MustLoadConfig() Config {
 	flag.StringVar(&cfg.OIDCMount, "oidc-mount", envOr("OIDC_MOUNT", "oidc"), "OIDC auth mount name (without auth/ prefix)")
 	flag.StringVar(&cfg.OIDCRole, "oidc-role", envOr("OIDC_ROLE", "default_role"), "Vault OIDC role name")
 	flag.StringVar(&cfg.OIDCRedirectURI, "oidc-redirect-uri", envOr("OIDC_REDIRECT_URI", "http://localhost:8250/oidc/callback"), "Vault OIDC callback URI")
+	flag.StringVar(&cfg.IdentityTokenRole, "identity-token-role", envOr("IDENTITY_TOKEN_ROLE", ""), "OIDC role name for identity token issuance (leave empty to disable)")
+	flag.StringVar(&cfg.IdentityTokenFile, "identity-token-file", envOr("IDENTITY_TOKEN_FILE", ""), "File path to write plaintext OIDC identity token (leave empty to disable)")
 	flag.StringVar(&cfg.StateFile, "state-file", defaultStateFile, "Path to sealed state envelope used by all backends")
 	flag.StringVar(&cfg.KeyStore, "keystore", defaultKeyStore, "Keystore backend: auto|file|dpapi|tpm")
 	flag.StringVar(&cfg.StateKeyFile, "state-key-file", defaultStateKeyFile, "Path to file keystore key (File backend only, defaults to same directory as state-file)")

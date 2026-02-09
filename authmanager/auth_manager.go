@@ -55,8 +55,9 @@ func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Clie
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Apply exponential backoff on retries (skip for first attempt)
+		// Use aggressive 150ms base with exponential doubling: 0ms → 150ms → 300ms → 600ms
 		if attempt > 0 {
-			backoffDuration = time.Duration(1<<uint(attempt-1)) * time.Second
+			backoffDuration = time.Duration(150<<uint(attempt-1)) * time.Millisecond
 			if a.Cfg.Debug {
 				a.Log.Printf("DEBUG: auth: retry attempt %d after %v (transient error: %v)", attempt, backoffDuration, lastErr)
 			}
@@ -149,15 +150,19 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 	return secret, err
 }
 
-// loginWithFallback attempts to authenticate with AppRole credentials, attempting in-memory secret ID first,
-// and falling back to wrapped secret ID if the in-memory credential fails.
+// loginWithFallback attempts to authenticate with AppRole credentials in priority order:
+// 1. In-memory secret ID (if available and not explicitly rejected)
+// 2. Wrapped secret ID from state (if available and in-memory was rejected or unavailable)
+// 3. OIDC bootstrap (as last resort)
+//
+// For transient errors (Vault unreachable), returns immediately without falling back further.
 // Returns (*vault.Secret, fallbackUsed, error).
 // If fallbackUsed is true, the caller should trigger a credential refresh to obtain a new in-memory secret ID
 // and replace the now-invalidated wrapped secret ID.
 func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Client) (*vault.Secret, bool, error) {
 	roleID := a.Creds.RoleID()
 
-	// 1) Prefer: in-memory secret-id (try first)
+	// 1) Prefer: in-memory secret-id (if available)
 	if roleID != "" {
 		if sid := a.Creds.InMemSecretID(); sid != "" {
 			if a.Cfg.Debug {
@@ -167,8 +172,16 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 			if err == nil {
 				return secret, false, nil
 			}
-			// In-memory secret ID failed; log and attempt fallback
-			a.Log.Printf("WARN: auth: in-memory secret-id authentication failed: %v (attempting fallback to wrapped secret-id)", err)
+
+			// Determine if this is a credential rejection or a transient error
+			if isCredentialRejected(err) {
+				// In-memory credential was explicitly rejected - log and try wrapped fallback
+				a.Log.Printf("WARN: auth: in-memory secret-id rejected: %v (attempting wrapped secret-id fallback)", err)
+			} else {
+				// Transient error (Vault unreachable, timeout, etc.) - return immediately
+				// Let the Client() retry loop handle retry with backoff
+				return nil, false, err
+			}
 		}
 	}
 
@@ -176,7 +189,7 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 	if roleID != "" {
 		if wrapTok := a.Creds.WrappedSecretIDToken(); wrapTok != "" {
 			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: attempting fallback with wrapped secret-id token from state")
+				a.Log.Printf("DEBUG: auth: attempting login with wrapped secret-id token from state")
 			}
 
 			// Validate the wrapped token before using it
@@ -189,11 +202,19 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 			// IMPORTANT: WithWrappingToken expects the SecretID to be the WRAPPING TOKEN
 			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
 			if err == nil {
-				a.Log.Printf("INFO: auth: successfully authenticated with fallback wrapped secret-id; will refresh credentials")
+				a.Log.Printf("INFO: auth: successfully authenticated with wrapped secret-id; will refresh credentials")
 				return secret, true, nil
 			}
-			// Wrapped fallback also failed; continue to bootstrap
-			a.Log.Printf("WARN: auth: wrapped secret-id authentication failed: %v (proceeding to bootstrap)", err)
+
+			// Wrapped auth failed - determine if we should retry or proceed to bootstrap
+			if isCredentialRejected(err) {
+				// Wrapped credential explicitly rejected; proceed to OIDC bootstrap
+				a.Log.Printf("WARN: auth: wrapped secret-id rejected: %v (proceeding to OIDC bootstrap)", err)
+			} else {
+				// Transient error - return immediately for retry
+				a.Log.Printf("WARN: auth: wrapped secret-id authentication failed with transient error: %v (will retry)", err)
+				return nil, false, err
+			}
 		}
 	}
 
