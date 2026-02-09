@@ -27,11 +27,11 @@ type Server struct {
 	serverSelector    interface{} // (*ServerSelector from main.go)
 	vaultSkipVerify   bool        // For proxy recreation
 	vaultNamespace    string      // For proxy recreation
-	authManager         *authmanager.AuthManager
-	tokenProvider       *authmanager.TokenProvider // For proxy recreation
-	identityTokenFunc   func() string              // Function to get current identity token
-	logger              *log.Logger
-	lastUpstreamState   bool // tracks if upstream was healthy on last check
+	authManager       *authmanager.AuthManager
+	tokenProvider     *authmanager.TokenProvider // For proxy recreation
+	identityTokenFunc func() string              // Function to get current identity token
+	logger            *log.Logger
+	lastUpstreamState bool // tracks if upstream was healthy on last check
 }
 
 type HealthStatus struct {
