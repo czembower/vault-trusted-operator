@@ -425,23 +425,24 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	// Save the current wrapped token before invalidation in case refresh fails.
-	// If we can't get a new one, we'll keep the existing one in state.
+	// Save the current wrapped token as a fallback
 	preservedToken := creds.WrappedSecretIDToken()
 
-	// 1. Invalidate the current wrapped token to prevent credential reuse.
-	//    This unwraps the token and consumes the secret ID, ensuring single-use guarantees.
-	if preservedToken != "" {
-		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, preservedToken, &t)
-	}
+	// CRITICAL FIX: Acquire new token FIRST, then invalidate the old one.
+	// This ensures we never lose the fallback credential.
+	// Older approach invalidated first, risking loss of token if refresh failed.
 
-	// 2. Get a fresh wrapped token for next startup (validated and stored in CredStore)
-	//    Only persist to state if this succeeds. If it fails, we keep the pre-invalidation token.
 	var refreshSucceeded bool
+	var newWrappedToken string
+
+	// 1. Try to get a fresh wrapped token for next startup
+	//    Only invalidate the old one if this succeeds.
 	if err := secretIDRefresher.RefreshWrappedSecretID(shutdownCtx, &t); err != nil {
-		logger.Printf("WARN: config: failed to obtain fresh wrapped secret-id for shutdown: %v (keeping existing token in state)", err)
+		logger.Printf("WARN: config: failed to obtain fresh wrapped secret-id for shutdown: %v", err)
+		logger.Printf("INFO: config: preserving existing wrapped secret-id token as fallback")
 		refreshSucceeded = false
 	} else {
+		newWrappedToken = creds.WrappedSecretIDToken()
 		logger.Printf("INFO: config: obtained fresh wrapped secret-id token (wrapping TTL: %s)", cfg.WrapTTL)
 
 		// Only warn if we actually had to fall back to role defaults
@@ -451,21 +452,28 @@ func main() {
 		refreshSucceeded = true
 	}
 
+	// 2. Only invalidate the old token if we successfully obtained a new one.
+	//    This prevents losing the fallback if refresh failed.
+	if refreshSucceeded && preservedToken != "" {
+		logger.Printf("INFO: config: invalidating old wrapped secret-id token")
+		secretIDRefresher.InvalidateWrappedSecretID(shutdownCtx, preservedToken, &t)
+	} else if preservedToken != "" {
+		logger.Printf("WARN: config: cannot invalidate old wrapped token (would lose fallback), keeping it in state")
+	}
+
 	// 3. Persist state for next startup
-	//    - If refresh succeeded: persist the new fresh token from CredStore and selected vault address
-	//    - If refresh failed: keep the pre-invalidation token (no state modification)
 	logger.Printf("INFO: config: persisting state for next startup")
 	st.Config = cfg
 	st.RoleID = creds.RoleID()
 
 	if refreshSucceeded {
 		// New token was successfully procured and validated
-		st.WrappedSecretIDToken = creds.WrappedSecretIDToken()
+		st.WrappedSecretIDToken = newWrappedToken
 		// Persist the server address only if credential refresh succeeded (indicates upstream was healthy)
 		st.SelectedVaultAddr = primary
 		logger.Printf("INFO: config: persisted fresh wrapped secret-id token and vault address to state")
 	} else {
-		// Refresh failed; preserve the pre-invalidation token that was already in state
+		// Refresh failed; preserve the existing token (it wasn't invalidated above)
 		st.WrappedSecretIDToken = preservedToken
 		// Don't persist SelectedVaultAddr if refresh failed - let next startup re-probe all addresses
 		// This forces a fresh server selection on next startup instead of using a potentially stale address

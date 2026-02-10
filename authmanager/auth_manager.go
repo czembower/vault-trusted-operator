@@ -70,7 +70,7 @@ func (a *AuthManager) Client(ctx context.Context, t *TokenProvider) (*vault.Clie
 			}
 		}
 
-		secret, fallbackUsed, err := a.loginWithFallback(ctx, client)
+		secret, fallbackUsed, err := a.loginWithFallback(ctx, client, t)
 		if err == nil {
 			// Success - start watcher and return
 			a.startWatcher(client, secret, t)
@@ -145,8 +145,8 @@ func (a *AuthManager) refreshCredentialsOnFallback(ctx context.Context, t *Token
 	}
 }
 
-func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.Secret, error) {
-	secret, _, err := a.loginWithFallback(ctx, client)
+func (a *AuthManager) login(ctx context.Context, client *vault.Client, t *TokenProvider) (*vault.Secret, error) {
+	secret, _, err := a.loginWithFallback(ctx, client, t)
 	return secret, err
 }
 
@@ -159,16 +159,25 @@ func (a *AuthManager) login(ctx context.Context, client *vault.Client) (*vault.S
 // Returns (*vault.Secret, fallbackUsed, error).
 // If fallbackUsed is true, the caller should trigger a credential refresh to obtain a new in-memory secret ID
 // and replace the now-invalidated wrapped secret ID.
-func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Client) (*vault.Secret, bool, error) {
+func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Client, t *TokenProvider) (*vault.Secret, bool, error) {
 	roleID := a.Creds.RoleID()
 
 	// 1) Prefer: in-memory secret-id (if available)
 	if roleID != "" {
 		if sid := a.Creds.InMemSecretID(); sid != "" {
-			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: attempting login with in-memory secret-id")
+			// Check credential lifecycle status for monitoring/debugging
+			if a.Creds.IsInMemSecretIDConsumed() {
+				a.Log.Printf("WARN: auth: attempting login with in-memory secret-id marked as consumed (single-use); this may fail")
 			}
-			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: sid}, false)
+			secretAge := a.Creds.InMemSecretIDAge()
+			if secretAge > a.Cfg.InMemSecretTTL {
+				a.Log.Printf("WARN: auth: in-memory secret-id age (%s) exceeds requested TTL (%s); may be expired", secretAge, a.Cfg.InMemSecretTTL)
+			}
+
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: attempting login with in-memory secret-id (age: %s)", secretAge)
+			}
+			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: sid}, false, t)
 			if err == nil {
 				return secret, false, nil
 			}
@@ -188,8 +197,13 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 	// 2) Fallback: wrapped secret-id token from *state*
 	if roleID != "" {
 		if wrapTok := a.Creds.WrappedSecretIDToken(); wrapTok != "" {
+			wrappedAge := a.Creds.WrappedSecretIDAge()
+			if wrappedAge > a.Cfg.WrapTTL {
+				a.Log.Printf("WARN: auth: wrapped secret-id age (%s) exceeds wrap TTL (%s); may be expired", wrappedAge, a.Cfg.WrapTTL)
+			}
+
 			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: attempting login with wrapped secret-id token from state")
+				a.Log.Printf("DEBUG: auth: attempting login with wrapped secret-id token from state (age: %s)", wrappedAge)
 			}
 
 			// Validate the wrapped token before using it
@@ -200,7 +214,7 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 			}
 
 			// IMPORTANT: WithWrappingToken expects the SecretID to be the WRAPPING TOKEN
-			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true)
+			secret, err := a.loginWithAppRole(ctx, client, roleID, approle.SecretID{FromString: wrapTok}, true, t)
 			if err == nil {
 				a.Log.Printf("INFO: auth: successfully authenticated with wrapped secret-id; will refresh credentials")
 				return secret, true, nil
@@ -224,18 +238,54 @@ func (a *AuthManager) loginWithFallback(ctx context.Context, client *vault.Clien
 	}
 
 	a.Log.Printf("INFO: auth: bootstrapping via OIDC (interactive)")
-	rid, sid, err := a.OIDC.Bootstrap(ctx, client.Address())
-	if err != nil {
-		return nil, false, err
-	}
-	a.Creds.SetRoleID(rid)
-	a.Creds.SetInMemSecretID(sid)
 
-	secret, err := a.loginWithAppRole(ctx, client, rid, approle.SecretID{FromString: sid}, false)
-	return secret, false, err
+	// Retry OIDC bootstrap on transient errors (e.g., Vault server temporarily unavailable)
+	// Don't retry on context deadline or cancellation
+	const maxOIDCRetries = 2
+	var lastOIDCErr error
+
+	for attempt := 0; attempt <= maxOIDCRetries; attempt++ {
+		rid, sid, err := a.OIDC.Bootstrap(ctx, client.Address())
+		if err == nil {
+			a.Creds.SetRoleID(rid)
+			a.Creds.SetInMemSecretID(sid)
+
+			secret, err := a.loginWithAppRole(ctx, client, rid, approle.SecretID{FromString: sid}, false, t)
+			return secret, false, err
+		}
+
+		lastOIDCErr = err
+
+		// Don't retry on context cancellation
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, false, err
+		}
+
+		// Only retry on transient errors
+		if !isTransientError(err) {
+			return nil, false, err
+		}
+
+		// If we have retries left, wait and retry
+		if attempt < maxOIDCRetries {
+			a.Log.Printf("WARN: auth: OIDC bootstrap attempt %d failed (transient error): %v; will retry", attempt+1, err)
+
+			// Small backoff before retry (100-200ms)
+			backoff := time.Duration(100<<uint(attempt)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			case <-time.After(backoff):
+				continue
+			}
+		}
+	}
+
+	a.Log.Printf("ERROR: auth: OIDC bootstrap failed after %d attempts: %v", maxOIDCRetries+1, lastOIDCErr)
+	return nil, false, lastOIDCErr
 }
 
-func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client, roleID string, sid approle.SecretID, wrapped bool) (*vault.Secret, error) {
+func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client, roleID string, sid approle.SecretID, wrapped bool, t *TokenProvider) (*vault.Secret, error) {
 	if a.Cfg.Debug {
 		a.Log.Printf("DEBUG: auth: attempting AppRole login")
 	}
@@ -256,6 +306,36 @@ func (a *AuthManager) loginWithAppRole(ctx context.Context, client *vault.Client
 	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
 		return nil, errors.New("vault login returned empty auth")
 	}
+
+	// Login succeeded - secret ID was consumed (single-use)
+	if !wrapped {
+		// Mark in-memory secret ID as consumed and log its age for monitoring
+		secretAge := a.Creds.InMemSecretIDAge()
+		a.Creds.MarkInMemSecretIDConsumed()
+		if a.Cfg.Debug {
+			a.Log.Printf("DEBUG: auth: consumed in-memory secret ID (age: %s)", secretAge)
+		}
+
+		// Trigger immediate background refresh to ensure we have fresh credentials for next authentication
+		if a.SIDRefr != nil {
+			go func() {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if _, err := a.SIDRefr.RefreshOnce(refreshCtx, a.Cfg.InMemSecretTTL, nil, t); err != nil {
+					if a.Cfg.Debug {
+						a.Log.Printf("DEBUG: auth: failed to refresh secret ID after login: %v (will retry on schedule)", err)
+					}
+				} else if a.Cfg.Debug {
+					a.Log.Printf("DEBUG: auth: refreshed secret ID immediately after login (consumed single-use credential)")
+				}
+			}()
+		}
+	} else if a.Cfg.Debug {
+		// Wrapped token was consumed
+		wrappedAge := a.Creds.WrappedSecretIDAge()
+		a.Log.Printf("DEBUG: auth: consumed wrapped secret ID token (age: %s)", wrappedAge)
+	}
+
 	return secret, nil
 }
 
@@ -288,6 +368,21 @@ func (a *AuthManager) startWatcher(client *vault.Client, loginSecret *vault.Secr
 	renewable, _ := loginSecret.TokenIsRenewable()
 	if a.Cfg.Debug {
 		a.Log.Printf("DEBUG: watcher: token TTL: %s | renewable: %t", ttl, renewable)
+	}
+
+	// Validate token/secret ID timing relationship for batch tokens
+	if !renewable {
+		proactiveReauthAt := time.Duration(float64(ttl) * 2.0 / 3.0)
+		secretIDRefreshInterval := time.Duration(float64(a.Cfg.InMemSecretTTL) * a.Cfg.RenewFraction)
+
+		if secretIDRefreshInterval > proactiveReauthAt {
+			a.Log.Printf("WARN: watcher: periodic secret ID refresh (%s) is slower than batch token reauth cycle (%s). Post-login refresh mitigates this, but consider increasing token_ttl in AppRole role config to reduce reauth frequency",
+				secretIDRefreshInterval, proactiveReauthAt)
+		}
+
+		if ttl < 30*time.Second {
+			a.Log.Printf("WARN: watcher: batch token TTL (%s) is very short; reauth may not complete before expiry. Consider longer token_ttl in AppRole role configuration", ttl)
+		}
 	}
 
 	// Store token with expiry info for batch token detection
@@ -368,23 +463,28 @@ func (a *AuthManager) ForceReauth() {
 
 // performProactiveReauth attempts to re-authenticate without holding the main lock.
 // This is called when batch tokens approach expiry.
+// CRITICAL: Acquires fresh in-memory secret IDs BEFORE attempting login to minimize credential staleness.
+// Note: Wrapped secret IDs are refreshed on their own schedule via RunWrappedSecretIDRefresher(),
+// not during proactive reauth, to avoid excessive refresh of long-lived fallback credentials.
 func (a *AuthManager) performProactiveReauth(t *TokenProvider) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure we have a fresh secret ID before attempting login.
-	// This is critical for batch tokens with single-use secret IDs.
+	// Get a fresh in-memory secret ID before attempting login
+	// This ensures we're using current credentials for the new token
 	if a.SIDRefr != nil {
-		if _, err := a.SIDRefr.RefreshOnce(ctx, a.Cfg.InMemSecretTTL, nil, t); err != nil {
+		if ttl, err := a.SIDRefr.RefreshOnce(ctx, a.Cfg.InMemSecretTTL, nil, t); err != nil {
 			if a.Cfg.Debug {
-				a.Log.Printf("DEBUG: auth: failed to refresh secret ID: %v (proceeding with existing)", err)
+				a.Log.Printf("DEBUG: auth: failed to get fresh in-memory secret ID: %v (proceeding with existing)", err)
 			}
-			// Fall through - attempt login with whatever secret ID we have
-		} else if a.Cfg.Debug {
-			a.Log.Printf("DEBUG: auth: obtained fresh secret ID")
+		} else {
+			if a.Cfg.Debug {
+				a.Log.Printf("DEBUG: auth: obtained fresh in-memory secret ID (TTL: %s)", ttl)
+			}
 		}
 	}
 
+	// Attempt login with fresh credentials (or existing if refresh failed)
 	newClient, err := a.Clients.New()
 	if err != nil {
 		if a.Cfg.Debug {
@@ -394,10 +494,10 @@ func (a *AuthManager) performProactiveReauth(t *TokenProvider) {
 		return
 	}
 
-	secret, err := a.login(ctx, newClient)
+	secret, err := a.login(ctx, newClient, t)
 	if err != nil {
 		if a.Cfg.Debug {
-			a.Log.Printf("DEBUG: auth: login failed: %v", err)
+			a.Log.Printf("DEBUG: auth: proactive re-authentication failed: %v", err)
 		}
 		a.ForceReauth()
 		return
@@ -414,7 +514,7 @@ func (a *AuthManager) performProactiveReauth(t *TokenProvider) {
 	}
 
 	if a.Cfg.Debug {
-		a.Log.Printf("DEBUG: auth: successfully authenticated new token")
+		a.Log.Printf("DEBUG: auth: successfully authenticated new token during proactive reauth")
 	}
 	a.startWatcher(newClient, secret, t)
 	a.client = newClient
@@ -488,12 +588,27 @@ func (p *TokenProvider) IsTokenValid() bool {
 	renewable, _ := p.renewable.Load().(bool)
 	remaining := time.Until(expiry)
 
-	// For batch tokens (non-renewable), be conservative: if less than 10% TTL remains, refresh
+	// For batch tokens (non-renewable), use adaptive buffer based on token TTL
+	// Shorter tokens get larger percentage buffer + fixed clock skew allowance
 	if !renewable && remaining > 0 {
 		originalTTL, _ := p.originalTTL.Load().(time.Duration)
 		if originalTTL > 0 {
-			tenPercent := originalTTL / 10
-			if remaining < tenPercent {
+			// Calculate buffer: percentage + fixed clock skew
+			var bufferPct float64
+			switch {
+			case originalTTL < 30*time.Second:
+				bufferPct = 0.30 // 30% buffer for very short tokens
+			case originalTTL < 2*time.Minute:
+				bufferPct = 0.20 // 20% buffer for short tokens
+			default:
+				bufferPct = 0.15 // 15% buffer for normal tokens
+			}
+
+			buffer := time.Duration(float64(originalTTL) * bufferPct)
+			// Add fixed 5s for clock skew between client and Vault server
+			buffer += 5 * time.Second
+
+			if remaining < buffer {
 				return false
 			}
 		}

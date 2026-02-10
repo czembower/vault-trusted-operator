@@ -76,13 +76,25 @@ func (s *SecretIDRefresher) Run(ctx context.Context, t *TokenProvider) {
 		// Reset backoff counter on successful refresh
 		consecutiveFailures = 0
 
-		sleepFor := time.Duration(float64(ttl) * s.Cfg.RenewFraction)
+		// Calculate refresh interval based on secret ID TTL.
+		// For short-lived credentials (< 2 minutes), use more aggressive refresh strategy (40%)
+		// to ensure fresh credentials are always available for batch token proactive reauth.
+		// For longer-lived credentials, use the configured RenewFraction (default 66%).
+		refreshFraction := s.Cfg.RenewFraction
+		if ttl < 2*time.Minute {
+			refreshFraction = 0.4 // Refresh at 40% for short-lived credentials
+			if s.Cfg.Debug {
+				s.Log.Printf("DEBUG: auth: using aggressive refresh fraction %.1f%% for short-lived secret-id", refreshFraction*100)
+			}
+		}
+
+		sleepFor := time.Duration(float64(ttl) * refreshFraction)
 		if sleepFor < 1*time.Second {
 			sleepFor = 1 * time.Second
 		}
 
 		if s.Cfg.Debug {
-			s.Log.Printf("DEBUG: auth: secret-id TTL: %s (refresh in %s)", ttl.String(), sleepFor.String())
+			s.Log.Printf("DEBUG: auth: secret-id TTL: %s (refresh in %s, %.1f%% of TTL)", ttl.String(), sleepFor.String(), refreshFraction*100)
 		}
 
 		currentTimer = time.NewTimer(sleepFor)
@@ -105,7 +117,9 @@ func (s *SecretIDRefresher) RunWrappedSecretIDRefresher(ctx context.Context, t *
 		s.Log.Printf("DEBUG: auth: wrapped secret-id refresher running (wrap-ttl: %s)", s.Cfg.WrapTTL.String())
 	}
 
-	// Refresh at 50% of wrap TTL, leaving a comfortable margin before expiry
+	// Refresh at 50% of wrap TTL, leaving a comfortable margin before expiry.
+	// This ensures we always have a fresh wrapped token in state if the app crashes.
+	// At shutdown, we obtain a fresh one to maximize downtime tolerance.
 	refreshInterval := time.Duration(float64(s.Cfg.WrapTTL) * 0.5)
 	if refreshInterval < 1*time.Minute {
 		refreshInterval = 1 * time.Minute
@@ -325,7 +339,7 @@ func (s *SecretIDRefresher) InvalidateWrappedSecretID(ctx context.Context, wrapp
 
 	// Use the wrapped token to authenticate via AppRole login with wrapped=true.
 	// This unwraps the token and consumes the single-use credential.
-	_, err = s.Auth.loginWithAppRole(ctx, client, s.Auth.Creds.RoleID(), approle.SecretID{FromString: wrappedToken}, true)
+	_, err = s.Auth.loginWithAppRole(ctx, client, s.Auth.Creds.RoleID(), approle.SecretID{FromString: wrappedToken}, true, t)
 	if err != nil {
 		s.Log.Printf("WARN: auth: failed to invalidate wrapped token: %v", err)
 		return

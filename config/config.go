@@ -34,7 +34,6 @@ type Config struct {
 	// Credential TTLs
 	CredTTL        time.Duration // User-configurable flag, default 5m
 	CredTTLRaw     string        // Raw flag value
-	TokenTTL       time.Duration // 90% of CredTTL, set automatically
 	WrapTTL        time.Duration // For wrapped secret-id
 	WrapTTLRaw     string
 	InMemSecretTTL time.Duration // For secret-id
@@ -78,7 +77,7 @@ func MustLoadConfig() Config {
 	flag.StringVar(&cfg.VaultAddrsCSV, "vault-addrs", defaultAddrs, "Comma-separated Vault addresses (overrides VAULT_ADDRS)")
 	flag.StringVar(&cfg.Namespace, "namespace", defaultNamespace, "Vault namespace")
 	defaultCredTTL := "5m"
-	flag.StringVar(&cfg.CredTTLRaw, "ephemeral-cred-ttl", defaultCredTTL, "Credential TTL for both Vault token and in-memory secret-id (e.g. 5m, 300s). Token TTL will be set to 90% of this value to avoid race conditions")
+	flag.StringVar(&cfg.CredTTLRaw, "ephemeral-cred-ttl", defaultCredTTL, "TTL to request for in-memory AppRole secret IDs (e.g. 5m, 300s). Note: Vault token TTL is controlled by the AppRole role configuration, not this flag")
 	flag.StringVar(&cfg.WrapTTLRaw, "wrap-ttl", defaultWrapTTL, "Wrapping TTL for state-persisted secret-id token (e.g. 24h, 3600s) - note that this same TTL will be requested for the AppRole secret ID itself")
 	flag.BoolVar(&cfg.InsecureTLS, "insecure-tls", envBool("VAULT_SKIP_VERIFY", false), "skip TLS verification (NOT recommended)")
 	flag.StringVar(&cfg.AppRoleMount, "approle-mount", envOr("APPROLE_MOUNT", "auth/approle"), "AppRole auth mount path")
@@ -119,7 +118,6 @@ func MustLoadConfig() Config {
 		panic("invalid -cred-ttl: " + err.Error())
 	}
 	cfg.CredTTL = credTTL
-	cfg.TokenTTL = time.Duration(float64(credTTL) * 0.9)
 	cfg.InMemSecretTTL = credTTL
 	wrapTTL, err := parseFlexibleDuration(cfg.WrapTTLRaw)
 	if err != nil {
@@ -127,6 +125,21 @@ func MustLoadConfig() Config {
 	}
 	cfg.WrapTTL = wrapTTL
 	cfg.RenewFraction = envFloat("RENEW_FRACTION", 2.0/3.0)
+
+	// Validate TTL relationships to prevent race conditions
+	if cfg.CredTTL < 30*time.Second {
+		panic(fmt.Sprintf("ephemeral-cred-ttl too short (%s); minimum 30s required to ensure secret IDs outlive token refresh cycles", cfg.CredTTL))
+	}
+
+	if cfg.WrapTTL < 1*time.Hour {
+		panic(fmt.Sprintf("wrap-ttl too short (%s); minimum 1h required for durable fallback credentials", cfg.WrapTTL))
+	}
+
+	// Warn if refresh timing is aggressive relative to typical token TTLs
+	secretIDRefreshInterval := time.Duration(float64(cfg.CredTTL) * cfg.RenewFraction)
+	if secretIDRefreshInterval < 20*time.Second {
+		fmt.Fprintf(os.Stderr, "WARN: secret ID refresh interval (%s) is very short; may cause excessive Vault API calls\n", secretIDRefreshInterval)
+	}
 
 	cfg.VaultAddrs = splitCSV(cfg.VaultAddrsCSV)
 	if len(cfg.VaultAddrs) == 0 {

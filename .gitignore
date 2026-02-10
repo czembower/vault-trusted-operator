@@ -35,3 +35,4 @@ go.work.sum
 state.json
 state.key
 vault-trusted-operator
+id-token

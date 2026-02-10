@@ -225,3 +225,50 @@ SocketMode=0660
 WantedBy=multi-user.target
 ```
 
+## TTL Configuration & Batch Token Considerations
+
+**Batch Token Behavior:** When using batch tokens (non-renewable), the application proactively refreshes at 2/3 of TTL to ensure a new token before expiry. However, certain TTL configurations can create race conditions if not carefully coordinated.
+
+**Recommended TTL Configuration:**
+```bash
+# AppRole Secret ID TTL (role-side configuration):
+secret_id_ttl = 600s  # 10 minutes
+
+# Application-side wrap TTL:
+WRAP_TTL=480s         # 8 minutes (80% of secret_id_ttl)
+
+# Server-side batch token TTL:
+# Typical: 3600s (1 hour) or higher
+# Avoid very short batch tokens (< 60s) without careful tuning
+```
+
+**Why These Values Matter:**
+- Proactive reauth for batch tokens happens at 2/3 TTL
+- Wrapped secret ID refresh happens at 50% of wrap TTL
+- If batch token TTL is significantly shorter than secret ID refresh interval, you risk credential staleness
+- Minimum recommended batch token TTL: **120 seconds** (allows two refresh cycles of secret credentials before token expires)
+
+**Environment-Specific Notes:**
+- If running on systems subject to sleep/suspend, ensure Vault server and client clocks are synchronized
+- Consider disabling system sleep on both client and server for production deployments
+- Monitor for "token rejected" and "wrapping token is invalid" errors in logs; these indicate timing misalignment
+
+## Known Issues & Fixes
+
+**Issue:** After 28+ minutes, credentials become stale and fail with "token rejected" → "invalid secret id" → "wrapping token invalid".
+
+**Root Cause:** Race condition between batch token proactive refresh (at 2/3 TTL) and credential refresh schedules, combined with lack of retries on OIDC bootstrap failures.
+
+**Applied Fixes (Automatic):**
+- ✅ Batch token refresh now acquires a **fresh in-memory secret ID** before login attempt
+- ✅ Wrapped token refresh remains on its own schedule (50% of TTL via background goroutine) - not refreshed on every batch token cycle
+- ✅ Wrapped token is only invalidated **after** a fresh replacement is confirmed ready at shutdown
+- ✅ OIDC bootstrap now retries on transient errors (network timeouts, etc.)
+- ✅ Batch token staleness detection increased from 10% to 15% remaining TTL for clock skew tolerance
+
+**User Recommendations:**
+- Use the TTL configuration values above
+- Review [ANALYSIS_TTL_RACE_CONDITIONS.md](./ANALYSIS_TTL_RACE_CONDITIONS.md) for in-depth technical details
+- Enable `--debug` flag if experiencing authentication errors to capture detailed timing logs
+- Test system wake/sleep scenarios before production deployment
+
