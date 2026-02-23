@@ -4,9 +4,7 @@ A lightweight service that brokers HashiCorp Vault authentication for local host
 
 ## Overview
 
-**Problem:** Managing Vault credentials securely is complex for applications that do not have a durable platform-issued source of machine identity.
-
-**Solution:** `vault-trusted-operator` runs as a privileged service that:
+`vault-trusted-operator` runs as a privileged service that:
 - Bootstraps via manual operator authentication (OIDC only) to set a host-scoped AppRole credential
 - Authenticates as the configured AppRole entity, resulting in a Vault token for the host
 - Manages Vault token lifecycle automatically (renewal and proactive refresh)
@@ -26,60 +24,13 @@ This pattern allows applications running on systems without inherent machine ide
 - **Proactive Refresh for Batch Tokens**: Non-renewable tokens are refreshed at 2/3 TTL by requesting new authentication
 - **Single-Use Secret ID Coordination**: Keeps fresh in-memory Secret IDs available for re-authentication if token renewal fails
 - **Wrapped Secret ID for host/application downtime**: A wrapped secret ID is encrypted and stored on the host at shutdown
-- **Identity Token Support (Optional)**: Automatically requests and refreshes Vault identity tokens (JWTs) from a configured role, with dynamic refresh based on JWT expiration claim (refreshes at 90% TTL)
-- **Plaintext Token File**: Optionally writes identity tokens to a plaintext file with secure permissions (0600) for simplified external application integration
 
 ### Secure Credential Storage
 - **Sealed State**: Credentials and configuration are encrypted at rest using OS keystore (TPM for Linux, DPAPI for Windows, or file-based fallback)
 - **No Secrets in Logs**: Credentials and secrets are never logged
 
 ### Access Control
-- **Process-Level Restrictions**: Whitelist which user/group IDs can access the broker via socket (Linux only)
-
-### Performance
-- **Minimal Proxy Overhead**: HTTP reverse proxy with optimized connection pooling
-- **Bounded Response Reading**: Prevents resource leaks from large responses
-- **Lock-Free Credential Snapshots**: Copy-on-write pattern for credential updates
-
-## Architecture
-
-```
-┌─────────────────────────────┐
-│  Host Process (unprivileged)│
-└────────────┬────────────────┘
-             │
-        Unix Socket (0600)
-        Access controlled
-        (or plain HTTP)
-             │
-             ▼
-┌─────────────────────────────────┐
-│ vault-trusted-operator          │
-│ ┌───────────────────────────────┤
-│ │ HTTP Broker                   │
-│ │ ├─ /health                    │
-│ │ ├─ /v1/* (reverse proxy)      │
-│ │                               │
-│ │ AuthManager                   │
-│ │ ├─ Token lifecycle            │
-│ │ ├─ Proactive reauth           │
-│ │ └─ Secret ID refresh          │
-│ │                               │
-│ │ CredStore                     │
-│ │ ├─ Role ID                    │
-│ │ ├─ Wrapped Secret ID token    │
-│ │ └─ In-memory Secret ID        │
-│ └───────────────────────────────┤
-└────────────┬────────────────────┘
-             │
-           HTTP(S)
-             │
-             ▼
-  ┌──────────────────────┐
-  │  HashiCorp Vault     │
-  │  AppRole Auth Method │
-  └──────────────────────┘
-```
+- **Process-Level Restrictions**: Configurable user/group IDs which can access the broker via socket (Linux only)
 
 ### Vault Dependencies
 
@@ -101,6 +52,7 @@ path "auth/approle/role/host-approle/secret-id" {
 
 [ ... additional application-specific access policies ]
 ```
+- To avoid excessive secret ID creation, `secret_id_num_uses` should be set to `1` for roles integrated with this utility.
 - OIDC auth method configured, with appropriate role and policy for a privileged operator to bootstrap application-specific AppRole auth, e.g.
 ```bash
 # Allow reading the AppRole role_id
@@ -242,7 +194,7 @@ WRAP_TTL=480s         # 8 minutes (80% of secret_id_ttl)
 # Avoid very short batch tokens (< 60s) without careful tuning
 ```
 
-**Why These Values Matter:**
+**Note:**
 - Proactive reauth for batch tokens happens at 2/3 TTL
 - Wrapped secret ID refresh happens at 50% of wrap TTL
 - If batch token TTL is significantly shorter than secret ID refresh interval, you risk credential staleness
@@ -251,24 +203,4 @@ WRAP_TTL=480s         # 8 minutes (80% of secret_id_ttl)
 **Environment-Specific Notes:**
 - If running on systems subject to sleep/suspend, ensure Vault server and client clocks are synchronized
 - Consider disabling system sleep on both client and server for production deployments
-- Monitor for "token rejected" and "wrapping token is invalid" errors in logs; these indicate timing misalignment
-
-## Known Issues & Fixes
-
-**Issue:** After 28+ minutes, credentials become stale and fail with "token rejected" → "invalid secret id" → "wrapping token invalid".
-
-**Root Cause:** Race condition between batch token proactive refresh (at 2/3 TTL) and credential refresh schedules, combined with lack of retries on OIDC bootstrap failures.
-
-**Applied Fixes (Automatic):**
-- ✅ Batch token refresh now acquires a **fresh in-memory secret ID** before login attempt
-- ✅ Wrapped token refresh remains on its own schedule (50% of TTL via background goroutine) - not refreshed on every batch token cycle
-- ✅ Wrapped token is only invalidated **after** a fresh replacement is confirmed ready at shutdown
-- ✅ OIDC bootstrap now retries on transient errors (network timeouts, etc.)
-- ✅ Batch token staleness detection increased from 10% to 15% remaining TTL for clock skew tolerance
-
-**User Recommendations:**
-- Use the TTL configuration values above
-- Review [ANALYSIS_TTL_RACE_CONDITIONS.md](./ANALYSIS_TTL_RACE_CONDITIONS.md) for in-depth technical details
-- Enable `--debug` flag if experiencing authentication errors to capture detailed timing logs
-- Test system wake/sleep scenarios before production deployment
-
+- Monitor for "token rejected" and "wrapping token is invalid" errors in logs which indicate timing misalignment
